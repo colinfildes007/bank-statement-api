@@ -1,8 +1,15 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
+
+# Load environment variables
+api_key = os.getenv("FASTAPI_API_KEY")
+webhook_secret = os.getenv("FASTAPI_WEBHOOK_SECRET")
+database_url = os.getenv("DATABASE_URL")
+app_env = os.getenv("APP_ENV", "development")
 
 app = FastAPI(
     title="Bank Statement API",
