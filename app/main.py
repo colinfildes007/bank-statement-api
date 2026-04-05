@@ -8,11 +8,13 @@ from app.auth import verify_api_key
 from app.database import Base, engine, get_db
 from app.models import Case, Document
 from app.schemas import CaseCreate, DocumentRegister, ReportRequest
+from app.tasks import validate_document_task, extract_document_task, categorise_document_task
+from app.celery_app import celery_app
 
 app = FastAPI(
     title="Bank Statement API",
     description="Starter API for Base44 bank statement processing orchestration",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -150,13 +152,14 @@ def validate_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    document.status = "Validating"
-    db.commit()
+    # Queue the async task
+    task = validate_document_task.delay(document_id)
 
     return {
-        "document_id": document.document_id,
-        "status": document.status,
-        "message": "Validation job accepted"
+        "document_id": document_id,
+        "task_id": task.id,
+        "status": "Validating",
+        "message": "Validation job queued"
     }
 
 
@@ -167,13 +170,14 @@ def extract_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    document.status = "Extracting"
-    db.commit()
+    # Queue the async task
+    task = extract_document_task.delay(document_id)
 
     return {
-        "document_id": document.document_id,
-        "status": document.status,
-        "message": "Extraction job accepted"
+        "document_id": document_id,
+        "task_id": task.id,
+        "status": "Extracting",
+        "message": "Extraction job queued"
     }
 
 
@@ -184,13 +188,26 @@ def categorise_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    document.status = "Categorising"
-    db.commit()
+    # Queue the async task
+    task = categorise_document_task.delay(document_id)
 
     return {
-        "document_id": document.document_id,
-        "status": document.status,
-        "message": "Categorisation job accepted"
+        "document_id": document_id,
+        "task_id": task.id,
+        "status": "Categorising",
+        "message": "Categorisation job queued"
+    }
+
+
+@app.get("/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
+def get_task_status(task_id: str):
+    """Get the status of a Celery task"""
+    task = celery_app.AsyncResult(task_id)
+    
+    return {
+        "task_id": task_id,
+        "status": task.status,
+        "result": task.result if task.status == "SUCCESS" else None
     }
 
 
