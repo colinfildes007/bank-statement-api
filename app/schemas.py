@@ -36,6 +36,8 @@ class DocumentResponse(BaseModel):
     source_type: str
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
+    storage_key: Optional[str] = None
+    file_hash: Optional[str] = None
     status: str
 
     class Config:

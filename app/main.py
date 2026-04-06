@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -8,6 +8,8 @@ from app.auth import verify_api_key
 from app.database import Base, engine, get_db
 from app.models import Case, Document
 from app.schemas import CaseCreate, DocumentRegister, ReportRequest
+from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
+from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task
 from app.celery_app import celery_app
 
@@ -95,6 +97,20 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
     }
 
 
+def _document_response(document: Document) -> dict:
+    return {
+        "document_id": document.document_id,
+        "case_id": document.case_id,
+        "original_filename": document.original_filename,
+        "source_type": document.source_type,
+        "file_size": document.file_size,
+        "mime_type": document.mime_type,
+        "storage_key": document.storage_key,
+        "file_hash": document.file_hash,
+        "status": document.status,
+    }
+
+
 @app.post("/cases/{case_id}/documents/register", dependencies=[Depends(verify_api_key)])
 def register_document(case_id: str, payload: DocumentRegister, db: Session = Depends(get_db)):
     case = db.query(Case).filter(Case.case_id == case_id).first()
@@ -118,15 +134,61 @@ def register_document(case_id: str, payload: DocumentRegister, db: Session = Dep
     db.commit()
     db.refresh(document)
 
-    return {
-        "document_id": document.document_id,
-        "case_id": document.case_id,
-        "original_filename": document.original_filename,
-        "source_type": document.source_type,
-        "file_size": document.file_size,
-        "mime_type": document.mime_type,
-        "status": document.status
-    }
+    return _document_response(document)
+
+
+@app.post("/cases/{case_id}/documents/upload", dependencies=[Depends(verify_api_key)])
+async def upload_document(
+    case_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    case = db.query(Case).filter(Case.case_id == case_id).first()
+
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    file_bytes = await file.read()
+
+    if len(file_bytes) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the maximum allowed size of {MAX_UPLOAD_SIZE} bytes",
+        )
+
+    file_hash = compute_sha256(file_bytes)
+    file_size = len(file_bytes)
+    mime_type = file.content_type or "application/octet-stream"
+    original_filename = file.filename or "unknown"
+
+    document_id = f"doc_{uuid4().hex[:8]}"
+    storage_key = f"{case_id}/{document_id}/{original_filename}"
+
+    upload_file_to_s3(file_bytes, storage_key, mime_type)
+
+    document = Document(
+        document_id=document_id,
+        case_id=case_id,
+        original_filename=original_filename,
+        source_type="upload",
+        file_size=file_size,
+        mime_type=mime_type,
+        storage_key=storage_key,
+        file_hash=file_hash,
+        status="Uploaded",
+    )
+
+    db.add(document)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        delete_file_from_s3(storage_key)
+        raise HTTPException(status_code=500, detail="Failed to save document metadata")
+
+    db.refresh(document)
+
+    return _document_response(document)
 
 
 @app.get("/documents/{document_id}/status", dependencies=[Depends(verify_api_key)])

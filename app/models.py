@@ -27,6 +27,8 @@ class Document(Base):
     source_type = Column(String(50), nullable=False)
     file_size = Column(Integer, nullable=True)
     mime_type = Column(String(255), nullable=True)
+    storage_key = Column(String(500), nullable=True)
+    file_hash = Column(String(64), nullable=True)
     status = Column(String(50), nullable=False, default="Uploaded")
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
