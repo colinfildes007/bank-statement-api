@@ -625,24 +625,18 @@ def set_manual_override(transaction_id: str, payload: ManualOverrideCreate, db: 
         existing.created_by = payload.created_by
         db.commit()
         db.refresh(existing)
-
-        txn.category = payload.category
-        txn.category_source = "manual"
-        txn.rule_id = existing.override_id
-        txn.needs_review = False
+        override = existing
+    else:
+        override = ManualOverride(
+            override_id=f"mo_{uuid4().hex[:8]}",
+            transaction_id=transaction_id,
+            category=payload.category,
+            notes=payload.notes,
+            created_by=payload.created_by,
+        )
+        db.add(override)
         db.commit()
-        return existing
-
-    override = ManualOverride(
-        override_id=f"mo_{uuid4().hex[:8]}",
-        transaction_id=transaction_id,
-        category=payload.category,
-        notes=payload.notes,
-        created_by=payload.created_by,
-    )
-    db.add(override)
-    db.commit()
-    db.refresh(override)
+        db.refresh(override)
 
     txn.category = payload.category
     txn.category_source = "manual"

@@ -151,8 +151,6 @@ def categorise_document_task(self, document_id: str, job_id: str):
                 txn.needs_review = False
                 categorised_count += 1
 
-        db.commit()
-
         document.status = "Categorised"
         db.commit()
 
