@@ -1,4 +1,5 @@
 from typing import Optional
+from datetime import datetime
 from pydantic import BaseModel
 
 
@@ -36,6 +37,8 @@ class DocumentResponse(BaseModel):
     source_type: str
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
+    storage_key: Optional[str] = None
+    file_hash: Optional[str] = None
     status: str
 
     class Config:
@@ -44,3 +47,43 @@ class DocumentResponse(BaseModel):
 
 class ReportRequest(BaseModel):
     report_type: str
+
+
+class ProcessingJobResponse(BaseModel):
+    job_id: str
+    case_id: str
+    document_id: Optional[str] = None
+    job_type: str
+    status: str
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    result_json: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionResponse(BaseModel):
+    exception_id: str
+    case_id: str
+    document_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    job_id: Optional[str] = None
+    exception_type: str
+    severity: str
+    status: str
+    title: str
+    description: Optional[str] = None
+    resolution_notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionActionRequest(BaseModel):
+    resolution_notes: Optional[str] = None
