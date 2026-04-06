@@ -9,13 +9,13 @@ from sqlalchemy.orm import Session
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
 from app.models import (
-    Account, Case, CaseException, CounterpartyRule, Document,
+    Account, AiReport, Case, CaseException, CounterpartyRule, Document,
     KeywordRule, ManualOverride, MerchantRule, ProcessingJob,
     RegexRule, Transaction, ValidationResult,
     CATEGORIES, CATEGORY_CODES,
 )
 from app.schemas import (
-    AccountResponse, CaseCreate,
+    AccountResponse, AiReportResponse, CaseCreate,
     CounterpartyRuleCreate, CounterpartyRuleResponse,
     DocumentRegister, ExceptionResponse, ExceptionActionRequest,
     KeywordRuleCreate, KeywordRuleResponse,
@@ -340,12 +340,24 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     return job
 
 
-@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)])
+@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)], response_model=AiReportResponse, status_code=202)
 def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(get_db)):
     case = db.query(Case).filter(Case.case_id == case_id).first()
 
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
+
+    if payload.report_type not in ("affordability",):
+        raise HTTPException(status_code=422, detail=f"Unsupported report_type '{payload.report_type}'. Supported: affordability")
+
+    report_id = f"rpt_{uuid4().hex[:12]}"
+    ai_report = AiReport(
+        report_id=report_id,
+        case_id=case_id,
+        report_type=payload.report_type,
+        status="Pending",
+    )
+    db.add(ai_report)
 
     job_id = _generate_job_id()
     job = ProcessingJob(
@@ -357,17 +369,29 @@ def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(
     )
     db.add(job)
     db.commit()
+    db.refresh(ai_report)
 
-    generate_report_task.delay(case_id, payload.report_type, job_id)
+    generate_report_task.delay(case_id, payload.report_type, job_id, report_id)
 
-    return {
-        "job_id": job_id,
-        "case_id": case_id,
-        "job_type": "generate_report",
-        "report_type": payload.report_type,
-        "status": "Pending",
-        "message": "Report generation job queued"
-    }
+    return ai_report
+
+
+@app.get("/cases/{case_id}/reports", dependencies=[Depends(verify_api_key)], response_model=list[AiReportResponse])
+def list_case_reports(case_id: str, db: Session = Depends(get_db)):
+    """List all AI reports generated for a case."""
+    case = db.query(Case).filter(Case.case_id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return db.query(AiReport).filter(AiReport.case_id == case_id).order_by(AiReport.requested_at.desc()).all()
+
+
+@app.get("/reports/{report_id}", dependencies=[Depends(verify_api_key)], response_model=AiReportResponse)
+def get_report(report_id: str, db: Session = Depends(get_db)):
+    """Get details of a specific AI report."""
+    report = db.query(AiReport).filter(AiReport.report_id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
 
 
 @app.get("/cases/{case_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])

@@ -50,6 +50,21 @@ class ReportRequest(BaseModel):
     report_type: str
 
 
+class AiReportResponse(BaseModel):
+    report_id: str
+    case_id: str
+    report_type: str
+    status: str
+    requested_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    output_json: Optional[str] = None
+    pdf_file_url: Optional[str] = None
+    spreadsheet_file_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ProcessingJobResponse(BaseModel):
     job_id: str
     case_id: str
