@@ -1,6 +1,24 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.sql import func
 from app.database import Base
+
+# Canonical category codes and display names
+CATEGORIES = {
+    "income": "Income",
+    "household_bills": "Household & Bills",
+    "everyday_spending": "Everyday Spending",
+    "transport": "Transport",
+    "financial_banking": "Financial & Banking",
+    "health_personal": "Health & Personal",
+    "leisure_lifestyle": "Leisure & Lifestyle",
+    "business": "Business",
+    "special_flag": "Special / Flag",
+    "uncategorised": "Uncategorised",
+    "unknown": "Unknown",
+    "needs_review": "Needs Review",
+}
+
+CATEGORY_CODES = set(CATEGORIES.keys())
 
 
 class Case(Base):
@@ -49,6 +67,97 @@ class ProcessingJob(Base):
     error_code = Column(String(50), nullable=True)
     error_message = Column(Text, nullable=True)
     result_json = Column(Text, nullable=True)
+
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transaction_id = Column(String(100), unique=True, index=True, nullable=False)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=False, index=True)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    date = Column(Date, nullable=True)
+    description = Column(String(500), nullable=True)
+    amount = Column(Numeric(15, 2), nullable=True)
+    credit = Column(Numeric(15, 2), nullable=True)
+    debit = Column(Numeric(15, 2), nullable=True)
+    balance = Column(Numeric(15, 2), nullable=True)
+    counterparty = Column(String(255), nullable=True)
+    reference = Column(String(500), nullable=True)
+    transaction_type = Column(String(50), nullable=True)
+    raw_text = Column(Text, nullable=True)
+    category = Column(String(100), nullable=True)
+    category_source = Column(String(50), nullable=True)
+    rule_id = Column(String(100), nullable=True)
+    needs_review = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class MerchantRule(Base):
+    __tablename__ = "merchant_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String(100), unique=True, index=True, nullable=False)
+    merchant_name = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False)
+    match_type = Column(String(20), nullable=False, default="contains")
+    case_sensitive = Column(Boolean, nullable=False, default=False)
+    priority = Column(Integer, nullable=False, default=100)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class KeywordRule(Base):
+    __tablename__ = "keyword_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String(100), unique=True, index=True, nullable=False)
+    keyword = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False)
+    match_type = Column(String(20), nullable=False, default="contains")
+    case_sensitive = Column(Boolean, nullable=False, default=False)
+    priority = Column(Integer, nullable=False, default=200)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class RegexRule(Base):
+    __tablename__ = "regex_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String(100), unique=True, index=True, nullable=False)
+    pattern = Column(String(1000), nullable=False)
+    category = Column(String(100), nullable=False)
+    flags = Column(String(20), nullable=True)
+    priority = Column(Integer, nullable=False, default=300)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CounterpartyRule(Base):
+    __tablename__ = "counterparty_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String(100), unique=True, index=True, nullable=False)
+    counterparty = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False)
+    match_type = Column(String(20), nullable=False, default="contains")
+    case_sensitive = Column(Boolean, nullable=False, default=False)
+    priority = Column(Integer, nullable=False, default=150)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ManualOverride(Base):
+    __tablename__ = "manual_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    override_id = Column(String(100), unique=True, index=True, nullable=False)
+    transaction_id = Column(String(100), ForeignKey("transactions.transaction_id"), unique=True, index=True, nullable=False)
+    category = Column(String(100), nullable=False)
+    notes = Column(Text, nullable=True)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class CaseException(Base):

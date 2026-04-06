@@ -1,9 +1,11 @@
 import json
 import time
 from datetime import datetime, timezone
+from uuid import uuid4
+from app.categorisation import apply_rules, UNRESOLVED_CATEGORIES
 from app.celery_app import celery_app
 from app.database import SessionLocal
-from app.models import Document, ProcessingJob
+from app.models import CaseException, Document, ProcessingJob, Transaction
 
 
 def _mark_job_started(db, job_id: str):
@@ -94,7 +96,7 @@ def extract_document_task(self, document_id: str, job_id: str):
 
 @celery_app.task(bind=True, name="categorise_document_task")
 def categorise_document_task(self, document_id: str, job_id: str):
-    """Async task to categorise a document"""
+    """Async task to categorise transactions extracted from a document."""
     db = SessionLocal()
     try:
         document = db.query(Document).filter(Document.document_id == document_id).first()
@@ -105,13 +107,63 @@ def categorise_document_task(self, document_id: str, job_id: str):
 
         _mark_job_started(db, job_id)
 
-        # Simulate categorisation work
-        time.sleep(2)
+        transactions = (
+            db.query(Transaction)
+            .filter(Transaction.document_id == document_id)
+            .all()
+        )
+
+        categorised_count = 0
+        uncategorised_count = 0
+        exceptions_created = 0
+
+        for txn in transactions:
+            category, source, rule_id = apply_rules(db, txn)
+            txn.category = category
+            txn.category_source = source
+            txn.rule_id = rule_id
+
+            if category in UNRESOLVED_CATEGORIES:
+                txn.needs_review = True
+                uncategorised_count += 1
+
+                exception_id = f"exc_{uuid4().hex[:8]}"
+                description_text = txn.description or "(no description)"
+                date_text = str(txn.date) if txn.date else "unknown date"
+                exc = CaseException(
+                    exception_id=exception_id,
+                    case_id=document.case_id,
+                    document_id=document_id,
+                    transaction_id=txn.transaction_id,
+                    job_id=job_id,
+                    exception_type="UNCATEGORISED_TRANSACTION",
+                    severity="Low",
+                    status="Open",
+                    title="Transaction could not be categorised",
+                    description=(
+                        f"Transaction '{description_text}' on {date_text} "
+                        f"did not match any categorisation rule."
+                    ),
+                )
+                db.add(exc)
+                exceptions_created += 1
+            else:
+                txn.needs_review = False
+                categorised_count += 1
+
+        db.commit()
 
         document.status = "Categorised"
         db.commit()
 
-        result = {"document_id": document_id, "status": "Categorised", "message": "Document categorisation completed"}
+        result = {
+            "document_id": document_id,
+            "status": "Categorised",
+            "transactions_processed": len(transactions),
+            "categorised_count": categorised_count,
+            "uncategorised_count": uncategorised_count,
+            "exceptions_created": exceptions_created,
+        }
         _mark_job_completed(db, job_id, result)
         return result
     except Exception as exc:
