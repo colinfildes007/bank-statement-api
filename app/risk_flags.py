@@ -160,10 +160,10 @@ def _flag_irregular_income(transactions) -> list[dict]:
     Uses the coefficient of variation (std / mean) across all credit amounts.
     """
     credits = [
-        float(txn.amount or txn.credit or 0)
+        float(txn.amount if txn.amount is not None else (txn.credit if txn.credit is not None else 0))
         for txn in transactions
         if (txn.direction or "").lower() == "credit"
-        and (txn.amount or txn.credit or 0) > 0
+        and float(txn.amount if txn.amount is not None else (txn.credit if txn.credit is not None else 0)) > 0
     ]
 
     if len(credits) < _MIN_INCOME_CREDITS:

@@ -220,4 +220,5 @@ class RiskFlag(Base):
 
 
 class Account(Base):
+    # TODO: columns to be defined when account extraction is implemented.
     pass
