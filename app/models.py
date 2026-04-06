@@ -219,6 +219,21 @@ class RiskFlag(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class AiReport(Base):
+    __tablename__ = "ai_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(String(100), unique=True, index=True, nullable=False)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    report_type = Column(String(100), nullable=False)
+    status = Column(String(50), nullable=False, default="Pending")
+    requested_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    output_json = Column(Text, nullable=True)
+    pdf_file_url = Column(String(500), nullable=True)
+    spreadsheet_file_url = Column(String(500), nullable=True)
+
+
 class Account(Base):
     # TODO: columns to be defined when account extraction is implemented.
     pass
