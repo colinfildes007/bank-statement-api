@@ -9,24 +9,24 @@ from sqlalchemy.orm import Session
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
 from app.models import (
-    Account, Case, CaseException, CounterpartyRule, Document,
+    Account, AiReport, Case, CaseException, CounterpartyRule, Document,
     KeywordRule, ManualOverride, MerchantRule, ProcessingJob,
-    RegexRule, Transaction, ValidationResult,
+    RegexRule, RiskFlag, Transaction, ValidationResult,
     CATEGORIES, CATEGORY_CODES,
 )
 from app.schemas import (
-    AccountResponse, CaseCreate,
+    AccountResponse, AiReportResponse, CaseCreate,
     CounterpartyRuleCreate, CounterpartyRuleResponse,
     DocumentRegister, ExceptionResponse, ExceptionActionRequest,
     KeywordRuleCreate, KeywordRuleResponse,
     ManualOverrideCreate, ManualOverrideResponse,
     MerchantRuleCreate, MerchantRuleResponse,
     ProcessingJobResponse, RegexRuleCreate, RegexRuleResponse,
-    ReportRequest, TransactionResponse, ValidationResultResponse,
+    ReportRequest, RiskFlagResponse, TransactionResponse, ValidationResultResponse,
 )
 from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
 from app.storage import MAX_UPLOAD_SIZE
-from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
+from app.tasks import validate_document_task, extract_document_task, categorise_document_task, compute_risk_flags_task, generate_report_task
 from app.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -340,12 +340,24 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     return job
 
 
-@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)])
+@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)], response_model=AiReportResponse, status_code=202)
 def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(get_db)):
     case = db.query(Case).filter(Case.case_id == case_id).first()
 
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
+
+    if payload.report_type not in ("affordability",):
+        raise HTTPException(status_code=422, detail=f"Unsupported report_type '{payload.report_type}'. Supported: affordability")
+
+    report_id = f"rpt_{uuid4().hex[:12]}"
+    ai_report = AiReport(
+        report_id=report_id,
+        case_id=case_id,
+        report_type=payload.report_type,
+        status="Pending",
+    )
+    db.add(ai_report)
 
     job_id = _generate_job_id()
     job = ProcessingJob(
@@ -357,17 +369,29 @@ def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(
     )
     db.add(job)
     db.commit()
+    db.refresh(ai_report)
 
-    generate_report_task.delay(case_id, payload.report_type, job_id)
+    generate_report_task.delay(case_id, payload.report_type, job_id, report_id)
 
-    return {
-        "job_id": job_id,
-        "case_id": case_id,
-        "job_type": "generate_report",
-        "report_type": payload.report_type,
-        "status": "Pending",
-        "message": "Report generation job queued"
-    }
+    return ai_report
+
+
+@app.get("/cases/{case_id}/reports", dependencies=[Depends(verify_api_key)], response_model=list[AiReportResponse])
+def list_case_reports(case_id: str, db: Session = Depends(get_db)):
+    """List all AI reports generated for a case."""
+    case = db.query(Case).filter(Case.case_id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return db.query(AiReport).filter(AiReport.case_id == case_id).order_by(AiReport.requested_at.desc()).all()
+
+
+@app.get("/reports/{report_id}", dependencies=[Depends(verify_api_key)], response_model=AiReportResponse)
+def get_report(report_id: str, db: Session = Depends(get_db)):
+    """Get details of a specific AI report."""
+    report = db.query(AiReport).filter(AiReport.report_id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
 
 
 @app.get("/cases/{case_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
@@ -705,3 +729,55 @@ def delete_manual_override(transaction_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No manual override found for this transaction")
     db.delete(override)
     db.commit()
+
+
+# ── Risk flags ────────────────────────────────────────────────────────────────
+
+@app.post("/documents/{document_id}/risk-flags", dependencies=[Depends(verify_api_key)])
+def trigger_risk_flags(document_id: str, db: Session = Depends(get_db)):
+    """Queue a job to compute risk flags for all transactions in a document."""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    job_id = _generate_job_id()
+    job = ProcessingJob(
+        job_id=job_id,
+        case_id=document.case_id,
+        document_id=document_id,
+        job_type="compute_risk_flags",
+        status="Pending",
+    )
+    db.add(job)
+    db.commit()
+
+    compute_risk_flags_task.delay(document_id, job_id)
+
+    return {
+        "job_id": job_id,
+        "document_id": document_id,
+        "job_type": "compute_risk_flags",
+        "status": "Pending",
+        "message": "Risk flag computation job queued",
+    }
+
+
+@app.get("/documents/{document_id}/risk-flags", dependencies=[Depends(verify_api_key)], response_model=list[RiskFlagResponse])
+def get_document_risk_flags(document_id: str, db: Session = Depends(get_db)):
+    """List all risk flags computed for a document."""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(RiskFlag).filter(RiskFlag.document_id == document_id).all()
+
+
+@app.get("/cases/{case_id}/risk-flags", dependencies=[Depends(verify_api_key)], response_model=list[RiskFlagResponse])
+def get_case_risk_flags(case_id: str, db: Session = Depends(get_db)):
+    """List all risk flags across all documents for a case."""
+    case = db.query(Case).filter(Case.case_id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    return db.query(RiskFlag).filter(RiskFlag.case_id == case_id).all()

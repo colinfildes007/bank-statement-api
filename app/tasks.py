@@ -5,6 +5,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 import boto3
@@ -14,7 +15,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.categorisation import apply_rules, UNRESOLVED_CATEGORIES
 from app.celery_app import celery_app
 from app.database import SessionLocal
-from app.models import Account, CaseException, Document, ProcessingJob, Transaction, ValidationResult
+from app.models import Account, AiReport, Case, CaseException, Document, ProcessingJob, RiskFlag, Transaction, ValidationResult
+from app.risk_flags import compute_risk_flags
 
 logger = logging.getLogger(__name__)
 
@@ -681,22 +683,467 @@ def categorise_document_task(self, document_id: str, job_id: str):
 
 
 @celery_app.task(bind=True, name="generate_report_task")
-def generate_report_task(self, case_id: str, report_type: str, job_id: str):
-    """Async task to generate a report for a case"""
-    import time
+def generate_report_task(self, case_id: str, report_type: str, job_id: str, report_id: str):
+    """Async task to generate an affordability report for a case."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+    )
 
     db = SessionLocal()
     try:
         _mark_job_started(db, job_id)
 
-        # Simulate report generation work
-        time.sleep(3)
+        # ── 1. Gather case data ──────────────────────────────────────────────
+        case = db.query(Case).filter(Case.case_id == case_id).first()
+        if not case:
+            raise ValueError(f"Case {case_id} not found")
 
-        result = {"case_id": case_id, "report_type": report_type, "status": "Generated", "message": "Report generation completed"}
+        accounts = db.query(Account).filter(Account.case_id == case_id).all()
+        transactions = db.query(Transaction).filter(Transaction.case_id == case_id).all()
+        exceptions = db.query(CaseException).filter(CaseException.case_id == case_id).all()
+
+        # ── 2. Summarise transactions by category ────────────────────────────
+        category_totals: dict[str, dict] = {}
+        for txn in transactions:
+            cat = txn.category or "uncategorised"
+            if cat not in category_totals:
+                category_totals[cat] = {"credits": Decimal("0"), "debits": Decimal("0"), "count": 0}
+            amount = txn.amount or Decimal("0")
+            # direction field is preferred; fall back to checking credit column when direction is absent
+            if txn.direction == "credit" or (not txn.direction and txn.credit and txn.credit > 0):
+                category_totals[cat]["credits"] += abs(amount)
+            else:
+                category_totals[cat]["debits"] += abs(amount)
+            category_totals[cat]["count"] += 1
+
+        flagged_transactions = [t for t in transactions if t.needs_review]
+        open_exceptions = [e for e in exceptions if e.status == "Open"]
+
+        total_credits = sum(v["credits"] for v in category_totals.values())
+        total_debits = sum(v["debits"] for v in category_totals.values())
+
+        # ── 3. Build OpenAI prompt ───────────────────────────────────────────
+        category_summary_text = "\n".join(
+            f"  - {cat}: {data['count']} transactions, credits £{data['credits']:.2f}, debits £{data['debits']:.2f}"
+            for cat, data in sorted(category_totals.items())
+        )
+        exceptions_text = "\n".join(
+            f"  - [{e.severity}] {e.title}: {e.description or ''}"
+            for e in open_exceptions[:20]
+        ) or "  None"
+        flagged_text = f"{len(flagged_transactions)} transactions flagged for review"
+
+        account_text = "\n".join(
+            f"  - {a.bank_name or 'Unknown bank'}, account {a.account_number_masked or 'N/A'}, "
+            f"opening balance £{a.opening_balance or 0:.2f}, closing balance £{a.closing_balance or 0:.2f}, "
+            f"period {a.statement_start_date} to {a.statement_end_date}"
+            for a in accounts
+        ) or "  No account data available"
+
+        prompt = f"""You are a financial analyst producing an affordability assessment for a mortgage or lending application.
+
+Case reference: {case.case_reference}
+Customer: {case.customer_name}
+Jurisdiction: {case.jurisdiction}
+
+Bank Accounts:
+{account_text}
+
+Transaction Category Summary (total credits £{total_credits:.2f}, total debits £{total_debits:.2f}):
+{category_summary_text}
+
+Open Exceptions ({len(open_exceptions)} total):
+{exceptions_text}
+
+Flagged: {flagged_text}
+
+Produce a structured affordability report as JSON with exactly these keys:
+{{
+  "overall_assessment": "<Acceptable|Marginal|Unacceptable>",
+  "summary": "<2-3 sentence plain-English summary>",
+  "monthly_income_estimate": <number or null>,
+  "monthly_expenditure_estimate": <number or null>,
+  "disposable_income_estimate": <number or null>,
+  "income_sources": ["<source>"],
+  "concerns": ["<concern>"],
+  "positive_indicators": ["<indicator>"],
+  "risk_flags": ["<flag>"],
+  "recommendations": ["<recommendation>"]
+}}
+
+Respond with valid JSON only, no prose outside the JSON block."""
+
+        # ── 4. Call OpenAI ───────────────────────────────────────────────────
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        ai_output: dict = {}
+        if openai_api_key:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_api_key)
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            ai_output = json.loads(raw)
+        else:
+            logger.warning("OPENAI_API_KEY not set – using placeholder affordability output")
+            # Divide by 3 assuming a standard 3-month bank statement period
+            ai_output = {
+                "overall_assessment": "Marginal",
+                "summary": "OpenAI API key not configured. This is a placeholder assessment.",
+                "monthly_income_estimate": float(total_credits / 3) if total_credits else None,
+                "monthly_expenditure_estimate": float(total_debits / 3) if total_debits else None,
+                "disposable_income_estimate": float((total_credits - total_debits) / 3) if total_credits else None,
+                "income_sources": [],
+                "concerns": ["OpenAI key not configured – assessment is unverified"],
+                "positive_indicators": [],
+                "risk_flags": [f"{len(open_exceptions)} open exceptions", f"{len(flagged_transactions)} flagged transactions"],
+                "recommendations": ["Configure OPENAI_API_KEY to generate a real assessment"],
+            }
+
+        # ── 5. Generate PDF ──────────────────────────────────────────────────
+        pdf_buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            pdf_buffer,
+            pagesize=A4,
+            leftMargin=2 * cm,
+            rightMargin=2 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+        )
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("Title2", parent=styles["Heading1"], fontSize=16, spaceAfter=6)
+        h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=12, spaceAfter=4)
+        body_style = styles["Normal"]
+        small_style = ParagraphStyle("Small", parent=styles["Normal"], fontSize=8)
+
+        assessment_colour = {
+            "Acceptable": colors.HexColor("#28a745"),
+            "Marginal": colors.HexColor("#fd7e14"),
+            "Unacceptable": colors.HexColor("#dc3545"),
+        }.get(ai_output.get("overall_assessment", ""), colors.grey)
+
+        story = [
+            Paragraph("Affordability Report", title_style),
+            Paragraph(f"Case Reference: {case.case_reference}", body_style),
+            Paragraph(f"Customer: {case.customer_name}", body_style),
+            Paragraph(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", small_style),
+            Spacer(1, 0.4 * cm),
+            HRFlowable(width="100%", thickness=1, color=colors.grey),
+            Spacer(1, 0.4 * cm),
+        ]
+
+        # Overall assessment banner
+        banner_data = [[Paragraph(
+            f"Overall Assessment: <b>{ai_output.get('overall_assessment', 'N/A')}</b>",
+            ParagraphStyle("Banner", parent=styles["Normal"], fontSize=13, textColor=colors.white),
+        )]]
+        banner_table = Table(banner_data, colWidths=["100%"])
+        banner_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), assessment_colour),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ]))
+        story += [banner_table, Spacer(1, 0.5 * cm)]
+
+        story += [Paragraph("Summary", h2_style), Paragraph(ai_output.get("summary", ""), body_style), Spacer(1, 0.4 * cm)]
+
+        # Financials table
+        fin_rows = [
+            [Paragraph("<b>Metric</b>", body_style), Paragraph("<b>Amount</b>", body_style)],
+        ]
+        for label, key in [
+            ("Est. Monthly Income", "monthly_income_estimate"),
+            ("Est. Monthly Expenditure", "monthly_expenditure_estimate"),
+            ("Est. Disposable Income", "disposable_income_estimate"),
+        ]:
+            val = ai_output.get(key)
+            fin_rows.append([label, f"£{val:,.2f}" if val is not None else "N/A"])
+        fin_table = Table(fin_rows, colWidths=[9 * cm, 7 * cm])
+        fin_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#343a40")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f8f9fa"), colors.white]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dee2e6")),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story += [Paragraph("Financial Estimates", h2_style), fin_table, Spacer(1, 0.5 * cm)]
+
+        # Category breakdown table
+        cat_rows = [
+            [Paragraph("<b>Category</b>", body_style), Paragraph("<b>Txns</b>", body_style),
+             Paragraph("<b>Credits</b>", body_style), Paragraph("<b>Debits</b>", body_style)],
+        ]
+        for cat, data in sorted(category_totals.items()):
+            cat_rows.append([cat, str(data["count"]), f"£{data['credits']:,.2f}", f"£{data['debits']:,.2f}"])
+        if len(cat_rows) > 1:
+            cat_table = Table(cat_rows, colWidths=[7 * cm, 2.5 * cm, 4 * cm, 4 * cm])
+            cat_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#343a40")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f8f9fa"), colors.white]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dee2e6")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story += [Paragraph("Transaction Category Breakdown", h2_style), cat_table, Spacer(1, 0.5 * cm)]
+
+        def _bullet_section(title, items):
+            if not items:
+                return []
+            return [Paragraph(title, h2_style)] + [
+                Paragraph(f"• {item}", body_style) for item in items
+            ] + [Spacer(1, 0.4 * cm)]
+
+        story += _bullet_section("Income Sources", ai_output.get("income_sources", []))
+        story += _bullet_section("Positive Indicators", ai_output.get("positive_indicators", []))
+        story += _bullet_section("Concerns", ai_output.get("concerns", []))
+        story += _bullet_section("Risk Flags", ai_output.get("risk_flags", []))
+        story += _bullet_section("Recommendations", ai_output.get("recommendations", []))
+
+        # Exceptions summary
+        if open_exceptions:
+            exc_rows = [[Paragraph("<b>Severity</b>", body_style), Paragraph("<b>Title</b>", body_style)]]
+            for e in open_exceptions[:50]:
+                exc_rows.append([e.severity, e.title])
+            exc_table = Table(exc_rows, colWidths=[3 * cm, 14 * cm])
+            exc_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#343a40")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#fff3cd"), colors.white]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dee2e6")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story += [Paragraph(f"Open Exceptions ({len(open_exceptions)})", h2_style), exc_table]
+
+        doc.build(story)
+        pdf_bytes = pdf_buffer.getvalue()
+
+        # ── 6. Generate XLSX ─────────────────────────────────────────────────
+        wb = openpyxl.Workbook()
+
+        # ── Sheet 1: Summary ──
+        ws_summary = wb.active
+        ws_summary.title = "Summary"
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="343A40")
+        centre = Alignment(horizontal="center")
+
+        ws_summary.append(["Affordability Report"])
+        ws_summary["A1"].font = Font(bold=True, size=14)
+        ws_summary.append(["Case Reference", case.case_reference])
+        ws_summary.append(["Customer", case.customer_name])
+        ws_summary.append(["Jurisdiction", case.jurisdiction])
+        ws_summary.append(["Generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")])
+        ws_summary.append([])
+        ws_summary.append(["Overall Assessment", ai_output.get("overall_assessment", "N/A")])
+        ws_summary.append(["Summary", ai_output.get("summary", "")])
+        ws_summary.append([])
+        ws_summary.append(["Est. Monthly Income", ai_output.get("monthly_income_estimate")])
+        ws_summary.append(["Est. Monthly Expenditure", ai_output.get("monthly_expenditure_estimate")])
+        ws_summary.append(["Est. Disposable Income", ai_output.get("disposable_income_estimate")])
+        ws_summary.column_dimensions["A"].width = 30
+        ws_summary.column_dimensions["B"].width = 60
+
+        for section_title, key in [
+            ("Income Sources", "income_sources"),
+            ("Positive Indicators", "positive_indicators"),
+            ("Concerns", "concerns"),
+            ("Risk Flags", "risk_flags"),
+            ("Recommendations", "recommendations"),
+        ]:
+            ws_summary.append([])
+            row = ws_summary.max_row + 1
+            ws_summary.append([section_title])
+            cell = ws_summary.cell(row=row, column=1)
+            cell.font = Font(bold=True)
+            for item in ai_output.get(key, []):
+                ws_summary.append(["", item])
+
+        # ── Sheet 2: Transactions ──
+        ws_txn = wb.create_sheet("Transactions")
+        txn_headers = ["transaction_id", "date", "description", "direction", "amount", "balance", "category", "needs_review"]
+        ws_txn.append(txn_headers)
+        for cell in ws_txn[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        for txn in transactions:
+            ws_txn.append([
+                txn.transaction_id,
+                str(txn.transaction_date) if txn.transaction_date else "",
+                txn.description_normalised or txn.description_raw or "",
+                txn.direction or "",
+                float(txn.amount) if txn.amount is not None else None,
+                float(txn.balance) if txn.balance is not None else None,
+                txn.category or "",
+                txn.needs_review,
+            ])
+        for col in ws_txn.columns:
+            ws_txn.column_dimensions[col[0].column_letter].width = 20
+
+        # ── Sheet 3: Category Breakdown ──
+        ws_cat = wb.create_sheet("Category Breakdown")
+        cat_headers = ["Category", "Transaction Count", "Total Credits (£)", "Total Debits (£)"]
+        ws_cat.append(cat_headers)
+        for cell in ws_cat[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        for cat, data in sorted(category_totals.items()):
+            ws_cat.append([cat, data["count"], float(data["credits"]), float(data["debits"])])
+        for col in ws_cat.columns:
+            ws_cat.column_dimensions[col[0].column_letter].width = 25
+
+        # ── Sheet 4: Exceptions ──
+        ws_exc = wb.create_sheet("Exceptions")
+        exc_headers = ["exception_id", "type", "severity", "status", "title", "description"]
+        ws_exc.append(exc_headers)
+        for cell in ws_exc[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        for e in exceptions:
+            ws_exc.append([e.exception_id, e.exception_type, e.severity, e.status, e.title, e.description or ""])
+        for col in ws_exc.columns:
+            ws_exc.column_dimensions[col[0].column_letter].width = 25
+
+        xlsx_buffer = io.BytesIO()
+        wb.save(xlsx_buffer)
+        xlsx_bytes = xlsx_buffer.getvalue()
+
+        # ── 7. Upload to S3 ──────────────────────────────────────────────────
+        aws_bucket = os.getenv("AWS_S3_BUCKET")
+        pdf_url: str | None = None
+        xlsx_url: str | None = None
+
+        if aws_bucket:
+            aws_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+            aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+            aws_region = os.getenv("AWS_REGION", "us-east-1")
+            s3 = boto3.client(
+                "s3",
+                region_name=aws_region,
+                aws_access_key_id=aws_key_id,
+                aws_secret_access_key=aws_secret,
+            )
+            pdf_key = f"reports/{case_id}/{report_id}.pdf"
+            xlsx_key = f"reports/{case_id}/{report_id}.xlsx"
+            s3.put_object(Bucket=aws_bucket, Key=pdf_key, Body=pdf_bytes, ContentType="application/pdf")
+            s3.put_object(
+                Bucket=aws_bucket, Key=xlsx_key, Body=xlsx_bytes,
+                ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            pdf_url = f"https://{aws_bucket}.s3.{aws_region}.amazonaws.com/{pdf_key}"
+            xlsx_url = f"https://{aws_bucket}.s3.{aws_region}.amazonaws.com/{xlsx_key}"
+        else:
+            logger.warning("AWS_S3_BUCKET not configured – report files not persisted to S3")
+
+        # ── 8. Update AiReport record ────────────────────────────────────────
+        ai_report = db.query(AiReport).filter(AiReport.report_id == report_id).first()
+        if ai_report:
+            ai_report.status = "Completed"
+            ai_report.completed_at = datetime.now(timezone.utc)
+            ai_report.output_json = json.dumps(ai_output)
+            ai_report.pdf_file_url = pdf_url
+            ai_report.spreadsheet_file_url = xlsx_url
+            db.commit()
+
+        result = {
+            "case_id": case_id,
+            "report_id": report_id,
+            "report_type": report_type,
+            "status": "Completed",
+            "overall_assessment": ai_output.get("overall_assessment"),
+            "pdf_file_url": pdf_url,
+            "spreadsheet_file_url": xlsx_url,
+        }
         _mark_job_completed(db, job_id, result)
         return result
+
     except Exception as exc:
+        # Mark AiReport as Failed
+        try:
+            ai_report = db.query(AiReport).filter(AiReport.report_id == report_id).first()
+            if ai_report:
+                ai_report.status = "Failed"
+                ai_report.completed_at = datetime.now(timezone.utc)
+                db.commit()
+        except Exception:
+            pass
         _mark_job_failed(db, job_id, "REPORT_ERROR", str(exc))
         raise
     finally:
         db.close()
+
+
+@celery_app.task(bind=True, name="compute_risk_flags_task")
+def compute_risk_flags_task(self, document_id: str, job_id: str):
+    """Async task to compute deterministic risk flags for all transactions in a document."""
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.document_id == document_id).first()
+
+        if not document:
+            _mark_job_failed(db, job_id, "NOT_FOUND", "Document not found")
+            raise ValueError(f"Document {document_id} not found")
+
+        _mark_job_started(db, job_id)
+
+        transactions = (
+            db.query(Transaction)
+            .filter(Transaction.document_id == document_id)
+            .all()
+        )
+
+        # Remove any previously computed flags for this document so the task is idempotent.
+        db.query(RiskFlag).filter(RiskFlag.document_id == document_id).delete()
+
+        flag_dicts = compute_risk_flags(transactions)
+
+        for fd in flag_dicts:
+            flag = RiskFlag(
+                flag_id=f"rf_{uuid4().hex[:8]}",
+                case_id=document.case_id,
+                document_id=document_id,
+                transaction_id=fd.get("transaction_id"),
+                flag_type=fd["flag_type"],
+                severity=fd["severity"],
+                title=fd["title"],
+                detail=fd.get("detail"),
+            )
+            db.add(flag)
+
+        db.commit()
+
+        # Build a per-type summary for the job result.
+        summary: dict[str, int] = {}
+        for fd in flag_dicts:
+            summary[fd["flag_type"]] = summary.get(fd["flag_type"], 0) + 1
+
+        result = {
+            "document_id": document_id,
+            "status": "Completed",
+            "flags_created": len(flag_dicts),
+            "summary": summary,
+        }
+        _mark_job_completed(db, job_id, result)
+        return result
+    except Exception as exc:
+        _mark_job_failed(db, job_id, "RISK_FLAGS_ERROR", str(exc))
+        raise
+    finally:
+        db.close()
+

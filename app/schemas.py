@@ -50,6 +50,21 @@ class ReportRequest(BaseModel):
     report_type: str
 
 
+class AiReportResponse(BaseModel):
+    report_id: str
+    case_id: str
+    report_type: str
+    status: str
+    requested_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    output_json: Optional[str] = None
+    pdf_file_url: Optional[str] = None
+    spreadsheet_file_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ProcessingJobResponse(BaseModel):
     job_id: str
     case_id: str
@@ -222,6 +237,23 @@ class CounterpartyRuleCreate(BaseModel):
 
 class CounterpartyRuleResponse(CounterpartyRuleCreate):
     rule_id: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ── Risk flags ────────────────────────────────────────────────────────────────
+
+class RiskFlagResponse(BaseModel):
+    flag_id: str
+    case_id: str
+    document_id: str
+    transaction_id: Optional[str] = None
+    flag_type: str
+    severity: str
+    title: str
+    detail: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:
