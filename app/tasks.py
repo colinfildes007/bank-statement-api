@@ -55,7 +55,7 @@ def _persist_reconciliation_exceptions(db, reconciliation_result, case_id: str, 
         "Low": "Low",
     }
     for finding in reconciliation_result.findings:
-        exception_id = f"exc_{uuid4().hex[:8]}"
+        exception_id = f"exc_{uuid4().hex[:16]}"
         exc = CaseException(
             exception_id=exception_id,
             case_id=case_id,

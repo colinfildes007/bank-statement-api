@@ -83,6 +83,11 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
+def _txn_id(txn: dict, index: int) -> str:
+    """Return the transaction identifier, falling back to a positional label."""
+    return txn.get("transaction_id") or f"index_{index}"
+
+
 # ---------------------------------------------------------------------------
 # Individual checks
 # ---------------------------------------------------------------------------
@@ -141,7 +146,7 @@ def check_amount_parse_consistency(extracted_data: dict) -> list:
             ))
 
     for i, txn in enumerate(extracted_data.get("transactions", [])):
-        txn_id = txn.get("transaction_id") or f"index_{i}"
+        txn_id = _txn_id(txn, i)
         for field_name in ("debit", "credit", "balance"):
             raw = txn.get(field_name)
             if raw is not None and _to_decimal(raw) is None:
@@ -180,7 +185,7 @@ def check_running_balance_consistency(extracted_data: dict) -> list:
     running = opening
 
     for i, txn in enumerate(transactions):
-        txn_id = txn.get("transaction_id") or f"index_{i}"
+        txn_id = _txn_id(txn, i)
         debit = _to_decimal(txn.get("debit"))
         credit = _to_decimal(txn.get("credit"))
         stated_balance = _to_decimal(txn.get("balance"))
@@ -280,7 +285,7 @@ def check_duplicate_transactions(extracted_data: dict) -> list:
     seen: dict = {}
 
     for i, txn in enumerate(transactions):
-        txn_id = txn.get("transaction_id") or f"index_{i}"
+        txn_id = _txn_id(txn, i)
         key = (
             txn.get("date"),
             str(txn.get("debit")),
