@@ -32,3 +32,39 @@ class Document(Base):
     status = Column(String(50), nullable=False, default="Uploaded")
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProcessingJob(Base):
+    __tablename__ = "processing_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(String(100), unique=True, index=True, nullable=False)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=True, index=True)
+    job_type = Column(String(50), nullable=False)
+    status = Column(String(50), nullable=False, default="Pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String(50), nullable=True)
+    error_message = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)
+
+
+class CaseException(Base):
+    __tablename__ = "exceptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exception_id = Column(String(100), unique=True, index=True, nullable=False)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=True, index=True)
+    transaction_id = Column(String(100), nullable=True, index=True)
+    job_id = Column(String(100), ForeignKey("processing_jobs.job_id"), nullable=True, index=True)
+    exception_type = Column(String(100), nullable=False)
+    severity = Column(String(50), nullable=False, default="Medium")
+    status = Column(String(50), nullable=False, default="Open")
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    resolution_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
