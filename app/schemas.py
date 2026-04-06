@@ -62,3 +62,26 @@ class ProcessingJobResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ExceptionResponse(BaseModel):
+    exception_id: str
+    case_id: str
+    document_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    job_id: Optional[str] = None
+    exception_type: str
+    severity: str
+    status: str
+    title: str
+    description: Optional[str] = None
+    resolution_notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionActionRequest(BaseModel):
+    resolution_notes: Optional[str] = None

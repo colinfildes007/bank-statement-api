@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -6,8 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
-from app.models import Case, Document, ProcessingJob
-from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest
+from app.models import Case, Document, ProcessingJob, CaseException
+from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
 from app.celery_app import celery_app
 
@@ -287,3 +288,57 @@ def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(
         "status": "Pending",
         "message": "Report generation job queued"
     }
+
+
+@app.get("/cases/{case_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
+def get_case_exceptions(case_id: str, db: Session = Depends(get_db)):
+    """List all exceptions for a case"""
+    case = db.query(Case).filter(Case.case_id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    return db.query(CaseException).filter(CaseException.case_id == case_id).all()
+
+
+@app.get("/documents/{document_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
+def get_document_exceptions(document_id: str, db: Session = Depends(get_db)):
+    """List all exceptions for a document"""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(CaseException).filter(CaseException.document_id == document_id).all()
+
+
+@app.post("/exceptions/{exception_id}/resolve", dependencies=[Depends(verify_api_key)], response_model=ExceptionResponse)
+def resolve_exception(exception_id: str, payload: ExceptionActionRequest, db: Session = Depends(get_db)):
+    """Resolve an exception"""
+    exc = db.query(CaseException).filter(CaseException.exception_id == exception_id).first()
+    if not exc:
+        raise HTTPException(status_code=404, detail="Exception not found")
+
+    exc.status = "Resolved"
+    exc.resolved_at = datetime.now(timezone.utc)
+    if payload.resolution_notes is not None:
+        exc.resolution_notes = payload.resolution_notes
+
+    db.commit()
+    db.refresh(exc)
+    return exc
+
+
+@app.post("/exceptions/{exception_id}/dismiss", dependencies=[Depends(verify_api_key)], response_model=ExceptionResponse)
+def dismiss_exception(exception_id: str, payload: ExceptionActionRequest, db: Session = Depends(get_db)):
+    """Dismiss an exception"""
+    exc = db.query(CaseException).filter(CaseException.exception_id == exception_id).first()
+    if not exc:
+        raise HTTPException(status_code=404, detail="Exception not found")
+
+    exc.status = "Dismissed"
+    exc.resolved_at = datetime.now(timezone.utc)
+    if payload.resolution_notes is not None:
+        exc.resolution_notes = payload.resolution_notes
+
+    db.commit()
+    db.refresh(exc)
+    return exc
