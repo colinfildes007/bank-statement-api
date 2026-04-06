@@ -235,5 +235,21 @@ class AiReport(Base):
 
 
 class Account(Base):
-    # TODO: columns to be defined when account extraction is implemented.
-    pass
+    __tablename__ = "accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(String(100), unique=True, index=True, nullable=False)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=False, index=True)
+    bank_name = Column(String(255), nullable=True)
+    account_holder_name = Column(String(255), nullable=True)
+    sort_code = Column(String(20), nullable=True)
+    account_number_masked = Column(String(50), nullable=True)
+    iban = Column(String(50), nullable=True)
+    swift_bic = Column(String(20), nullable=True)
+    account_type = Column(String(100), nullable=True)
+    statement_start_date = Column(Date, nullable=True)
+    statement_end_date = Column(Date, nullable=True)
+    opening_balance = Column(Numeric(precision=18, scale=2), nullable=True)
+    closing_balance = Column(Numeric(precision=18, scale=2), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

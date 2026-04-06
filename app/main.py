@@ -52,7 +52,8 @@ def _generate_job_id() -> str:
 
 @app.on_event("startup")
 def startup():
-    Base.metadata.create_all(bind=engine)
+    if engine is not None:
+        Base.metadata.create_all(bind=engine)
 
 
 @app.get("/")
