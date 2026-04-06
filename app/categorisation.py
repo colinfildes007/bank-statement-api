@@ -78,7 +78,7 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
         .all()
     )
     for rule in merchant_rules:
-        if _text_matches(transaction.description, rule.merchant_name, rule.match_type, rule.case_sensitive):
+        if _text_matches(transaction.description_raw, rule.merchant_name, rule.match_type, rule.case_sensitive):
             return rule.category, "merchant", rule.rule_id
 
     # 3. Counterparty rules — match against counterparty field
@@ -100,7 +100,7 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
         .all()
     )
     for rule in keyword_rules:
-        if _text_matches(transaction.description, rule.keyword, rule.match_type, rule.case_sensitive) or \
+        if _text_matches(transaction.description_raw, rule.keyword, rule.match_type, rule.case_sensitive) or \
                 _text_matches(transaction.reference, rule.keyword, rule.match_type, rule.case_sensitive):
             return rule.category, "keyword", rule.rule_id
 
@@ -114,7 +114,7 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
     for rule in regex_rules:
         try:
             compiled = re.compile(rule.pattern, _regex_flags(rule.flags))
-            if (transaction.description and compiled.search(transaction.description)) or \
+            if (transaction.description_raw and compiled.search(transaction.description_raw)) or \
                     (transaction.reference and compiled.search(transaction.reference)):
                 return rule.category, "regex", rule.rule_id
         except re.error:
