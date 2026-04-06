@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -68,3 +68,19 @@ class CaseException(Base):
     resolution_notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ValidationResult(Base):
+    __tablename__ = "validation_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    validation_result_id = Column(String(100), unique=True, index=True, nullable=False)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=False, index=True)
+    job_id = Column(String(100), ForeignKey("processing_jobs.job_id"), nullable=False, index=True)
+    check_name = Column(String(100), nullable=False)
+    severity = Column(String(50), nullable=False, default="Medium")
+    passed = Column(Boolean, nullable=False)
+    result_code = Column(String(100), nullable=True)
+    message = Column(Text, nullable=True)
+    details_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

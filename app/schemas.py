@@ -87,3 +87,19 @@ class ExceptionResponse(BaseModel):
 
 class ExceptionActionRequest(BaseModel):
     resolution_notes: Optional[str] = None
+
+
+class ValidationResultResponse(BaseModel):
+    validation_result_id: str
+    document_id: str
+    job_id: str
+    check_name: str
+    severity: str
+    passed: bool
+    result_code: Optional[str] = None
+    message: Optional[str] = None
+    details_json: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

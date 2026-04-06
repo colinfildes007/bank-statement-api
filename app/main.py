@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
-from app.models import Case, Document, ProcessingJob, CaseException
-from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest
+from app.models import Case, Document, ProcessingJob, CaseException, ValidationResult
+from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest, ValidationResultResponse
 from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
 from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
@@ -364,6 +364,16 @@ def get_case_exceptions(case_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Case not found")
 
     return db.query(CaseException).filter(CaseException.case_id == case_id).all()
+
+
+@app.get("/documents/{document_id}/validation-results", dependencies=[Depends(verify_api_key)], response_model=list[ValidationResultResponse])
+def get_document_validation_results(document_id: str, db: Session = Depends(get_db)):
+    """List all validation check results for a document"""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(ValidationResult).filter(ValidationResult.document_id == document_id).all()
 
 
 @app.get("/documents/{document_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
