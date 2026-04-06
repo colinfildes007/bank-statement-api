@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
-from app.models import Case, Document, ProcessingJob, CaseException
-from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest
+from app.models import Case, Document, ProcessingJob, CaseException, Account, Transaction
+from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest, AccountResponse, TransactionResponse
 from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
 from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Bank Statement API",
     description="Starter API for Base44 bank statement processing orchestration",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 app.add_middleware(
@@ -408,3 +408,43 @@ def dismiss_exception(exception_id: str, payload: ExceptionActionRequest, db: Se
     db.commit()
     db.refresh(exc)
     return exc
+
+
+@app.get("/documents/{document_id}/accounts", dependencies=[Depends(verify_api_key)], response_model=list[AccountResponse])
+def get_document_accounts(document_id: str, db: Session = Depends(get_db)):
+    """List extracted accounts for a document"""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(Account).filter(Account.document_id == document_id).all()
+
+
+@app.get("/accounts/{account_id}", dependencies=[Depends(verify_api_key)], response_model=AccountResponse)
+def get_account(account_id: str, db: Session = Depends(get_db)):
+    """Get a single extracted account by ID"""
+    account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return account
+
+
+@app.get("/accounts/{account_id}/transactions", dependencies=[Depends(verify_api_key)], response_model=list[TransactionResponse])
+def get_account_transactions(account_id: str, db: Session = Depends(get_db)):
+    """List all transactions for an account"""
+    account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return db.query(Transaction).filter(Transaction.account_id == account_id).all()
+
+
+@app.get("/transactions/{transaction_id}", dependencies=[Depends(verify_api_key)], response_model=TransactionResponse)
+def get_transaction(transaction_id: str, db: Session = Depends(get_db)):
+    """Get a single transaction by ID"""
+    txn = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    return txn
