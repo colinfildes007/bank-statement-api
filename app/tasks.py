@@ -332,6 +332,39 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
     return outcomes
 
 
+def _mark_job_completed_with_warnings(db, job_id: str, result: dict):
+    job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
+    if job:
+        job.status = "CompletedWithWarnings"
+        job.completed_at = datetime.now(timezone.utc)
+        job.result_json = json.dumps(result)
+        db.commit()
+
+
+def _persist_reconciliation_exceptions(db, reconciliation_result, case_id: str, document_id: str, job_id: str):
+    """Create CaseException rows for every finding in *reconciliation_result*."""
+    severity_map = {
+        "Critical": "Critical",
+        "High": "High",
+        "Medium": "Medium",
+        "Low": "Low",
+    }
+    for finding in reconciliation_result.findings:
+        exception_id = f"exc_{uuid4().hex[:16]}"
+        exc = CaseException(
+            exception_id=exception_id,
+            case_id=case_id,
+            document_id=document_id,
+            transaction_id=finding.transaction_id,
+            job_id=job_id,
+            exception_type=finding.check,
+            severity=severity_map.get(finding.severity, "Medium"),
+            status="Open",
+            title=finding.title,
+            description=finding.description,
+        )
+        db.add(exc)
+    db.commit()
 @celery_app.task(bind=True, name="validate_document_task")
 def validate_document_task(self, document_id: str, job_id: str):
     """Async task to validate a document with real file checks."""
@@ -388,11 +421,12 @@ def extract_document_task(self, document_id: str, job_id: str):
       3. Normalises the response
       4. Saves Account and Transaction records
       5. Creates exceptions for low-confidence rows
-      6. Updates the document and job status
+      6. Runs reconciliation on the extracted data
+      7. Updates the document and job status
     """
     from app.documentai import CONFIDENCE_THRESHOLD, process_document
+    from app.reconciliation import run_reconciliation
     from app.storage import download_file_from_s3
-
     db = SessionLocal()
     try:
         document = db.query(Document).filter(Document.document_id == document_id).first()
@@ -437,6 +471,7 @@ def extract_document_task(self, document_id: str, job_id: str):
         # 4. Persist Transactions + create exceptions for uncertain rows
         saved_count = 0
         exception_count = 0
+        txn_list = []
         for idx, txn_data in enumerate(extraction.transactions):
             transaction_id = f"txn_{uuid4().hex[:8]}"
             txn = Transaction(
@@ -459,6 +494,13 @@ def extract_document_task(self, document_id: str, job_id: str):
             db.add(txn)
             db.flush()
             saved_count += 1
+            txn_list.append({
+                "transaction_id": transaction_id,
+                "direction": txn_data.direction,
+                "amount": float(txn_data.amount) if txn_data.amount is not None else None,
+                "balance": float(txn_data.balance) if txn_data.balance is not None else None,
+                "transaction_date": txn_data.transaction_date.isoformat() if txn_data.transaction_date else None,
+            })
 
             if txn_data.extractor_confidence < CONFIDENCE_THRESHOLD:
                 exception_id = f"exc_{uuid4().hex[:8]}"
@@ -481,24 +523,73 @@ def extract_document_task(self, document_id: str, job_id: str):
                 db.add(exc_record)
                 exception_count += 1
 
-        # 5. Update document status
-        document.status = "Extracted"
         db.commit()
+
+        # 5. Reconcile the extracted data
+        extracted_data = {
+            "document_id": document_id,
+            "opening_balance": float(acct_data.opening_balance) if acct_data.opening_balance is not None else None,
+            "closing_balance": float(acct_data.closing_balance) if acct_data.closing_balance is not None else None,
+            "transactions": txn_list,
+        }
+        reconciliation_result = run_reconciliation(extracted_data)
+
+        _persist_reconciliation_exceptions(
+            db,
+            reconciliation_result,
+            case_id=document.case_id,
+            document_id=document_id,
+            job_id=job_id,
+        )
+
+        outcome = reconciliation_result.outcome  # "passed" | "warning" | "failed"
+        finding_summaries = [
+            {
+                "check": f.check,
+                "severity": f.severity,
+                "title": f.title,
+                "transaction_id": f.transaction_id,
+            }
+            for f in reconciliation_result.findings
+        ]
 
         result = {
             "document_id": document_id,
             "account_id": account_id,
             "transactions_saved": saved_count,
             "exceptions_created": exception_count,
-            "status": "Extracted",
-            "message": "Document extraction completed",
+            "reconciliation": {
+                "outcome": outcome,
+                "finding_count": len(reconciliation_result.findings),
+                "findings": finding_summaries,
+            },
         }
-        _mark_job_completed(db, job_id, result)
+
+        if outcome == "failed":
+            document.status = "ExtractionFailed"
+            db.commit()
+            _mark_job_failed(
+                db, job_id, "RECONCILIATION_FAILED",
+                f"Reconciliation failed with {len(reconciliation_result.findings)} finding(s).",
+            )
+            result["status"] = "ExtractionFailed"
+            result["message"] = "Extraction reconciliation failed — see exceptions for details."
+        elif outcome == "warning":
+            document.status = "ExtractionWarning"
+            db.commit()
+            _mark_job_completed_with_warnings(db, job_id, result)
+            result["status"] = "ExtractionWarning"
+            result["message"] = "Extraction completed with reconciliation warnings — see exceptions for details."
+        else:
+            document.status = "Extracted"
+            db.commit()
+            _mark_job_completed(db, job_id, result)
+            result["status"] = "Extracted"
+            result["message"] = "Extraction and reconciliation completed successfully."
+
         logger.info(
-            "Extraction complete for %s: %d transactions, %d exceptions",
-            document_id,
-            saved_count,
-            exception_count,
+            "Extraction complete for %s: %d transactions, %d exceptions, reconciliation=%s",
+            document_id, saved_count, exception_count, outcome,
         )
         return result
 
