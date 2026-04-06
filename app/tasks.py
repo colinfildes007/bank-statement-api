@@ -14,7 +14,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.categorisation import apply_rules, UNRESOLVED_CATEGORIES
 from app.celery_app import celery_app
 from app.database import SessionLocal
-from app.models import Account, CaseException, Document, ProcessingJob, Transaction, ValidationResult
+from app.models import Account, CaseException, Document, ProcessingJob, RiskFlag, Transaction, ValidationResult
+from app.risk_flags import compute_risk_flags
 
 logger = logging.getLogger(__name__)
 
@@ -697,6 +698,65 @@ def generate_report_task(self, case_id: str, report_type: str, job_id: str):
         return result
     except Exception as exc:
         _mark_job_failed(db, job_id, "REPORT_ERROR", str(exc))
+        raise
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True, name="compute_risk_flags_task")
+def compute_risk_flags_task(self, document_id: str, job_id: str):
+    """Async task to compute deterministic risk flags for all transactions in a document."""
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.document_id == document_id).first()
+
+        if not document:
+            _mark_job_failed(db, job_id, "NOT_FOUND", "Document not found")
+            raise ValueError(f"Document {document_id} not found")
+
+        _mark_job_started(db, job_id)
+
+        transactions = (
+            db.query(Transaction)
+            .filter(Transaction.document_id == document_id)
+            .all()
+        )
+
+        # Remove any previously computed flags for this document so the task is idempotent.
+        db.query(RiskFlag).filter(RiskFlag.document_id == document_id).delete()
+
+        flag_dicts = compute_risk_flags(transactions)
+
+        for fd in flag_dicts:
+            flag = RiskFlag(
+                flag_id=f"rf_{uuid4().hex[:8]}",
+                case_id=document.case_id,
+                document_id=document_id,
+                transaction_id=fd.get("transaction_id"),
+                flag_type=fd["flag_type"],
+                severity=fd["severity"],
+                title=fd["title"],
+                detail=fd.get("detail"),
+            )
+            db.add(flag)
+
+        db.commit()
+
+        # Build a per-type summary for the job result.
+        summary: dict[str, int] = {}
+        for fd in flag_dicts:
+            summary[fd["flag_type"]] = summary.get(fd["flag_type"], 0) + 1
+
+        result = {
+            "document_id": document_id,
+            "status": "Completed",
+            "flags_created": len(flag_dicts),
+            "summary": summary,
+        }
+        _mark_job_completed(db, job_id, result)
+        return result
+    except Exception as exc:
+        _mark_job_failed(db, job_id, "RISK_FLAGS_ERROR", str(exc))
         raise
     finally:
         db.close()

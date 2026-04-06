@@ -228,6 +228,23 @@ class CounterpartyRuleResponse(CounterpartyRuleCreate):
         from_attributes = True
 
 
+# ── Risk flags ────────────────────────────────────────────────────────────────
+
+class RiskFlagResponse(BaseModel):
+    flag_id: str
+    case_id: str
+    document_id: str
+    transaction_id: Optional[str] = None
+    flag_type: str
+    severity: str
+    title: str
+    detail: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
 # ── Manual overrides ──────────────────────────────────────────────────────────
 
 class ManualOverrideCreate(BaseModel):

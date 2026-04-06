@@ -204,4 +204,21 @@ class ValidationResult(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class RiskFlag(Base):
+    __tablename__ = "risk_flags"
+
+    id = Column(Integer, primary_key=True, index=True)
+    flag_id = Column(String(100), unique=True, index=True, nullable=False)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=False, index=True)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=False, index=True)
+    transaction_id = Column(String(100), nullable=True, index=True)
+    flag_type = Column(String(100), nullable=False)
+    severity = Column(String(50), nullable=False, default="Medium")
+    title = Column(String(255), nullable=False)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Account(Base):
+    # TODO: columns to be defined when account extraction is implemented.
+    pass
