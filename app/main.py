@@ -1,3 +1,4 @@
+import logging
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
@@ -12,6 +13,8 @@ from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
 from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task
 from app.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Bank Statement API",
@@ -181,8 +184,9 @@ async def upload_document(
     db.add(document)
     try:
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        logger.error("Failed to save document metadata for %s: %s", document_id, exc)
         delete_file_from_s3(storage_key)
         raise HTTPException(status_code=500, detail="Failed to save document metadata")
 

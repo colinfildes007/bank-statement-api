@@ -13,7 +13,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", 52428800))  # 50 MB
 
 
 def get_s3_client():
@@ -54,7 +54,7 @@ def delete_file_from_s3(storage_key: str) -> None:
     try:
         client = get_s3_client()
         client.delete_object(Bucket=AWS_S3_BUCKET, Key=storage_key)
-    except (BotoCoreError, ClientError, HTTPException) as exc:
+    except (BotoCoreError, ClientError) as exc:
         logger.error("S3 cleanup failed for key %s: %s", storage_key, exc)
 
 
