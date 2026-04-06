@@ -8,8 +8,22 @@ from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
-from app.models import Case, Document, ProcessingJob, CaseException
-from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest, ExceptionResponse, ExceptionActionRequest
+from app.models import (
+    Account, Case, CaseException, CounterpartyRule, Document,
+    KeywordRule, ManualOverride, MerchantRule, ProcessingJob,
+    RegexRule, Transaction, ValidationResult,
+    CATEGORIES, CATEGORY_CODES,
+)
+from app.schemas import (
+    AccountResponse, CaseCreate,
+    CounterpartyRuleCreate, CounterpartyRuleResponse,
+    DocumentRegister, ExceptionResponse, ExceptionActionRequest,
+    KeywordRuleCreate, KeywordRuleResponse,
+    ManualOverrideCreate, ManualOverrideResponse,
+    MerchantRuleCreate, MerchantRuleResponse,
+    ProcessingJobResponse, RegexRuleCreate, RegexRuleResponse,
+    ReportRequest, TransactionResponse, ValidationResultResponse,
+)
 from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3
 from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
@@ -20,7 +34,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Bank Statement API",
     description="Starter API for Base44 bank statement processing orchestration",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 app.add_middleware(
@@ -366,6 +380,16 @@ def get_case_exceptions(case_id: str, db: Session = Depends(get_db)):
     return db.query(CaseException).filter(CaseException.case_id == case_id).all()
 
 
+@app.get("/documents/{document_id}/validation-results", dependencies=[Depends(verify_api_key)], response_model=list[ValidationResultResponse])
+def get_document_validation_results(document_id: str, db: Session = Depends(get_db)):
+    """List all validation check results for a document"""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(ValidationResult).filter(ValidationResult.document_id == document_id).all()
+
+
 @app.get("/documents/{document_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
 def get_document_exceptions(document_id: str, db: Session = Depends(get_db)):
     """List all exceptions for a document"""
@@ -408,3 +432,276 @@ def dismiss_exception(exception_id: str, payload: ExceptionActionRequest, db: Se
     db.commit()
     db.refresh(exc)
     return exc
+
+
+@app.get("/documents/{document_id}/accounts", dependencies=[Depends(verify_api_key)], response_model=list[AccountResponse])
+def get_document_accounts(document_id: str, db: Session = Depends(get_db)):
+    """List extracted accounts for a document"""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return db.query(Account).filter(Account.document_id == document_id).all()
+
+
+@app.get("/accounts/{account_id}", dependencies=[Depends(verify_api_key)], response_model=AccountResponse)
+def get_account(account_id: str, db: Session = Depends(get_db)):
+    """Get a single extracted account by ID"""
+    account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return account
+
+
+@app.get("/accounts/{account_id}/transactions", dependencies=[Depends(verify_api_key)], response_model=list[TransactionResponse])
+def get_account_transactions(account_id: str, db: Session = Depends(get_db)):
+    """List all transactions for an account"""
+    account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return db.query(Transaction).filter(Transaction.account_id == account_id).all()
+
+
+@app.get("/transactions/{transaction_id}", dependencies=[Depends(verify_api_key)], response_model=TransactionResponse)
+def get_transaction(transaction_id: str, db: Session = Depends(get_db)):
+    """Get a single transaction by ID"""
+    txn = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    return txn
+
+# ── Category taxonomy ─────────────────────────────────────────────────────────
+
+@app.get("/categories", dependencies=[Depends(verify_api_key)])
+def list_categories():
+    """Return the full category taxonomy."""
+    return [{"code": code, "name": name} for code, name in CATEGORIES.items()]
+
+
+# ── Merchant rules ────────────────────────────────────────────────────────────
+
+@app.get("/rules/merchants", dependencies=[Depends(verify_api_key)], response_model=list[MerchantRuleResponse])
+def list_merchant_rules(db: Session = Depends(get_db)):
+    """List all merchant categorisation rules."""
+    return db.query(MerchantRule).order_by(MerchantRule.priority.asc()).all()
+
+
+@app.post("/rules/merchants", dependencies=[Depends(verify_api_key)], response_model=MerchantRuleResponse, status_code=201)
+def create_merchant_rule(payload: MerchantRuleCreate, db: Session = Depends(get_db)):
+    """Create a merchant categorisation rule."""
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(status_code=422, detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}")
+    if payload.match_type not in ("exact", "contains", "startswith"):
+        raise HTTPException(status_code=422, detail="match_type must be one of: exact, contains, startswith")
+
+    rule = MerchantRule(
+        rule_id=f"mr_{uuid4().hex[:8]}",
+        merchant_name=payload.merchant_name,
+        category=payload.category,
+        match_type=payload.match_type,
+        case_sensitive=payload.case_sensitive,
+        priority=payload.priority,
+        enabled=payload.enabled,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@app.delete("/rules/merchants/{rule_id}", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_merchant_rule(rule_id: str, db: Session = Depends(get_db)):
+    """Delete a merchant categorisation rule."""
+    rule = db.query(MerchantRule).filter(MerchantRule.rule_id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Merchant rule not found")
+    db.delete(rule)
+    db.commit()
+
+
+# ── Keyword rules ─────────────────────────────────────────────────────────────
+
+@app.get("/rules/keywords", dependencies=[Depends(verify_api_key)], response_model=list[KeywordRuleResponse])
+def list_keyword_rules(db: Session = Depends(get_db)):
+    """List all keyword categorisation rules."""
+    return db.query(KeywordRule).order_by(KeywordRule.priority.asc()).all()
+
+
+@app.post("/rules/keywords", dependencies=[Depends(verify_api_key)], response_model=KeywordRuleResponse, status_code=201)
+def create_keyword_rule(payload: KeywordRuleCreate, db: Session = Depends(get_db)):
+    """Create a keyword categorisation rule."""
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(status_code=422, detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}")
+    if payload.match_type not in ("exact", "contains", "startswith"):
+        raise HTTPException(status_code=422, detail="match_type must be one of: exact, contains, startswith")
+
+    rule = KeywordRule(
+        rule_id=f"kr_{uuid4().hex[:8]}",
+        keyword=payload.keyword,
+        category=payload.category,
+        match_type=payload.match_type,
+        case_sensitive=payload.case_sensitive,
+        priority=payload.priority,
+        enabled=payload.enabled,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@app.delete("/rules/keywords/{rule_id}", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_keyword_rule(rule_id: str, db: Session = Depends(get_db)):
+    """Delete a keyword categorisation rule."""
+    rule = db.query(KeywordRule).filter(KeywordRule.rule_id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Keyword rule not found")
+    db.delete(rule)
+    db.commit()
+
+
+# ── Regex rules ───────────────────────────────────────────────────────────────
+
+@app.get("/rules/regex", dependencies=[Depends(verify_api_key)], response_model=list[RegexRuleResponse])
+def list_regex_rules(db: Session = Depends(get_db)):
+    """List all regex categorisation rules."""
+    return db.query(RegexRule).order_by(RegexRule.priority.asc()).all()
+
+
+@app.post("/rules/regex", dependencies=[Depends(verify_api_key)], response_model=RegexRuleResponse, status_code=201)
+def create_regex_rule(payload: RegexRuleCreate, db: Session = Depends(get_db)):
+    """Create a regex categorisation rule."""
+    import re as _re
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(status_code=422, detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}")
+    try:
+        _re.compile(payload.pattern)
+    except _re.error as e:
+        raise HTTPException(status_code=422, detail=f"Invalid regex pattern: {e}")
+
+    rule = RegexRule(
+        rule_id=f"rr_{uuid4().hex[:8]}",
+        pattern=payload.pattern,
+        category=payload.category,
+        flags=payload.flags,
+        priority=payload.priority,
+        enabled=payload.enabled,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@app.delete("/rules/regex/{rule_id}", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_regex_rule(rule_id: str, db: Session = Depends(get_db)):
+    """Delete a regex categorisation rule."""
+    rule = db.query(RegexRule).filter(RegexRule.rule_id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Regex rule not found")
+    db.delete(rule)
+    db.commit()
+
+
+# ── Counterparty rules ────────────────────────────────────────────────────────
+
+@app.get("/rules/counterparties", dependencies=[Depends(verify_api_key)], response_model=list[CounterpartyRuleResponse])
+def list_counterparty_rules(db: Session = Depends(get_db)):
+    """List all counterparty categorisation rules."""
+    return db.query(CounterpartyRule).order_by(CounterpartyRule.priority.asc()).all()
+
+
+@app.post("/rules/counterparties", dependencies=[Depends(verify_api_key)], response_model=CounterpartyRuleResponse, status_code=201)
+def create_counterparty_rule(payload: CounterpartyRuleCreate, db: Session = Depends(get_db)):
+    """Create a counterparty categorisation rule."""
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(status_code=422, detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}")
+    if payload.match_type not in ("exact", "contains", "startswith"):
+        raise HTTPException(status_code=422, detail="match_type must be one of: exact, contains, startswith")
+
+    rule = CounterpartyRule(
+        rule_id=f"cr_{uuid4().hex[:8]}",
+        counterparty=payload.counterparty,
+        category=payload.category,
+        match_type=payload.match_type,
+        case_sensitive=payload.case_sensitive,
+        priority=payload.priority,
+        enabled=payload.enabled,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@app.delete("/rules/counterparties/{rule_id}", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_counterparty_rule(rule_id: str, db: Session = Depends(get_db)):
+    """Delete a counterparty categorisation rule."""
+    rule = db.query(CounterpartyRule).filter(CounterpartyRule.rule_id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Counterparty rule not found")
+    db.delete(rule)
+    db.commit()
+
+
+# ── Transactions ──────────────────────────────────────────────────────────────
+
+@app.get("/documents/{document_id}/transactions", dependencies=[Depends(verify_api_key)], response_model=list[TransactionResponse])
+def list_document_transactions(document_id: str, db: Session = Depends(get_db)):
+    """List all transactions extracted from a document."""
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return db.query(Transaction).filter(Transaction.document_id == document_id).all()
+
+
+# ── Manual overrides ──────────────────────────────────────────────────────────
+
+@app.post("/transactions/{transaction_id}/override", dependencies=[Depends(verify_api_key)], response_model=ManualOverrideResponse, status_code=201)
+def set_manual_override(transaction_id: str, payload: ManualOverrideCreate, db: Session = Depends(get_db)):
+    """Set or replace the manual category override for a transaction."""
+    txn = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(status_code=422, detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}")
+
+    existing = db.query(ManualOverride).filter(ManualOverride.transaction_id == transaction_id).first()
+    if existing:
+        existing.category = payload.category
+        existing.notes = payload.notes
+        existing.created_by = payload.created_by
+        db.commit()
+        db.refresh(existing)
+        override = existing
+    else:
+        override = ManualOverride(
+            override_id=f"mo_{uuid4().hex[:8]}",
+            transaction_id=transaction_id,
+            category=payload.category,
+            notes=payload.notes,
+            created_by=payload.created_by,
+        )
+        db.add(override)
+        db.commit()
+        db.refresh(override)
+
+    txn.category = payload.category
+    txn.category_source = "manual"
+    txn.rule_id = override.override_id
+    txn.needs_review = False
+    db.commit()
+    return override
+
+
+@app.delete("/transactions/{transaction_id}/override", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_manual_override(transaction_id: str, db: Session = Depends(get_db)):
+    """Remove the manual category override for a transaction."""
+    override = db.query(ManualOverride).filter(ManualOverride.transaction_id == transaction_id).first()
+    if not override:
+        raise HTTPException(status_code=404, detail="No manual override found for this transaction")
+    db.delete(override)
+    db.commit()

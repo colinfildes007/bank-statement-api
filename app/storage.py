@@ -58,6 +58,20 @@ def delete_file_from_s3(storage_key: str) -> None:
         logger.error("S3 cleanup failed for key %s: %s", storage_key, exc)
 
 
+def download_file_from_s3(storage_key: str) -> bytes:
+    """Download an object from S3 and return its bytes."""
+    if not AWS_S3_BUCKET:
+        raise RuntimeError("Object storage is not configured")
+
+    client = get_s3_client()
+    try:
+        response = client.get_object(Bucket=AWS_S3_BUCKET, Key=storage_key)
+        return response["Body"].read()
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("S3 download failed for key %s: %s", storage_key, exc)
+        raise RuntimeError(f"Failed to download file from storage: {exc}") from exc
+
+
 def compute_sha256(file_bytes: bytes) -> str:
     """Return the hex-encoded SHA-256 hash of the given bytes."""
     return hashlib.sha256(file_bytes).hexdigest()

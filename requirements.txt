@@ -7,3 +7,5 @@ celery
 redis
 boto3
 python-multipart
+pypdf
+google-cloud-documentai
