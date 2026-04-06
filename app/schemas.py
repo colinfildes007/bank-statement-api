@@ -1,4 +1,5 @@
 from typing import Optional
+from datetime import datetime
 from pydantic import BaseModel
 
 
@@ -44,3 +45,20 @@ class DocumentResponse(BaseModel):
 
 class ReportRequest(BaseModel):
     report_type: str
+
+
+class ProcessingJobResponse(BaseModel):
+    job_id: str
+    case_id: str
+    document_id: Optional[str] = None
+    job_type: str
+    status: str
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    result_json: Optional[str] = None
+
+    class Config:
+        from_attributes = True

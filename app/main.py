@@ -6,9 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
 from app.database import Base, engine, get_db
-from app.models import Case, Document
-from app.schemas import CaseCreate, DocumentRegister, ReportRequest
-from app.tasks import validate_document_task, extract_document_task, categorise_document_task
+from app.models import Case, Document, ProcessingJob
+from app.schemas import CaseCreate, DocumentRegister, ProcessingJobResponse, ReportRequest
+from app.tasks import validate_document_task, extract_document_task, categorise_document_task, generate_report_task
 from app.celery_app import celery_app
 
 app = FastAPI(
@@ -24,6 +24,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _generate_job_id() -> str:
+    return f"job_{uuid4().hex[:8]}"
 
 
 @app.on_event("startup")
@@ -152,13 +156,24 @@ def validate_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Queue the async task
-    task = validate_document_task.delay(document_id)
+    job_id = _generate_job_id()
+    job = ProcessingJob(
+        job_id=job_id,
+        case_id=document.case_id,
+        document_id=document_id,
+        job_type="validate",
+        status="Pending",
+    )
+    db.add(job)
+    db.commit()
+
+    validate_document_task.delay(document_id, job_id)
 
     return {
+        "job_id": job_id,
         "document_id": document_id,
-        "task_id": task.id,
-        "status": "Validating",
+        "job_type": "validate",
+        "status": "Pending",
         "message": "Validation job queued"
     }
 
@@ -170,13 +185,24 @@ def extract_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Queue the async task
-    task = extract_document_task.delay(document_id)
+    job_id = _generate_job_id()
+    job = ProcessingJob(
+        job_id=job_id,
+        case_id=document.case_id,
+        document_id=document_id,
+        job_type="extract",
+        status="Pending",
+    )
+    db.add(job)
+    db.commit()
+
+    extract_document_task.delay(document_id, job_id)
 
     return {
+        "job_id": job_id,
         "document_id": document_id,
-        "task_id": task.id,
-        "status": "Extracting",
+        "job_type": "extract",
+        "status": "Pending",
         "message": "Extraction job queued"
     }
 
@@ -188,13 +214,24 @@ def categorise_document(document_id: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Queue the async task
-    task = categorise_document_task.delay(document_id)
+    job_id = _generate_job_id()
+    job = ProcessingJob(
+        job_id=job_id,
+        case_id=document.case_id,
+        document_id=document_id,
+        job_type="categorise",
+        status="Pending",
+    )
+    db.add(job)
+    db.commit()
+
+    categorise_document_task.delay(document_id, job_id)
 
     return {
+        "job_id": job_id,
         "document_id": document_id,
-        "task_id": task.id,
-        "status": "Categorising",
+        "job_type": "categorise",
+        "status": "Pending",
         "message": "Categorisation job queued"
     }
 
@@ -203,12 +240,23 @@ def categorise_document(document_id: str, db: Session = Depends(get_db)):
 def get_task_status(task_id: str):
     """Get the status of a Celery task"""
     task = celery_app.AsyncResult(task_id)
-    
+
     return {
         "task_id": task_id,
         "status": task.status,
         "result": task.result if task.status == "SUCCESS" else None
     }
+
+
+@app.get("/jobs/{job_id}", dependencies=[Depends(verify_api_key)], response_model=ProcessingJobResponse)
+def get_job(job_id: str, db: Session = Depends(get_db)):
+    """Get the status and result of a processing job"""
+    job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return job
 
 
 @app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)])
@@ -218,11 +266,24 @@ def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    report_id = f"rep_{uuid4().hex[:8]}"
+    job_id = _generate_job_id()
+    job = ProcessingJob(
+        job_id=job_id,
+        case_id=case_id,
+        document_id=None,
+        job_type="generate_report",
+        status="Pending",
+    )
+    db.add(job)
+    db.commit()
+
+    generate_report_task.delay(case_id, payload.report_type, job_id)
 
     return {
-        "report_id": report_id,
+        "job_id": job_id,
         "case_id": case_id,
+        "job_type": "generate_report",
         "report_type": payload.report_type,
-        "status": "Requested"
+        "status": "Pending",
+        "message": "Report generation job queued"
     }
