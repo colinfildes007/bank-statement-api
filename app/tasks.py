@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import boto3
+import pypdf
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.celery_app import celery_app
@@ -234,7 +235,6 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
     is_pdf = (document.mime_type == "application/pdf") or ext == ".pdf"
     if is_pdf and file_bytes:
         try:
-            import pypdf  # noqa: PLC0415
             reader = pypdf.PdfReader(io.BytesIO(file_bytes))
             page_count = len(reader.pages)
             detected = page_count > 0
@@ -288,7 +288,6 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
     extracted_text = ""
     if is_pdf and file_bytes:
         try:
-            import pypdf  # noqa: PLC0415
             reader = pypdf.PdfReader(io.BytesIO(file_bytes))
             extracted_text = " ".join(
                 (page.extract_text() or "") for page in reader.pages[:5]
@@ -310,7 +309,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         ),
         details={"dates_found": dates_found[:10]},
     )
-    outcomes.append({"check": "statement_date_range_present", "passed": date_range_present or not extracted_text})
+    outcomes.append({"check": "statement_date_range_present", "passed": date_range_present if extracted_text else True})
 
     # --- 7. bank_type_identified ---
     lower_text = extracted_text.lower() + " " + (document.original_filename or "").lower()
@@ -328,7 +327,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         ),
         details={"matched_banks": matched_banks},
     )
-    outcomes.append({"check": "bank_type_identified", "passed": bank_identified or not extracted_text})
+    outcomes.append({"check": "bank_type_identified", "passed": bank_identified if extracted_text else True})
 
     return outcomes
 
@@ -352,7 +351,6 @@ def validate_document_task(self, document_id: str, job_id: str):
             o["passed"] for o in outcomes
             if o.get("check") in ("file_exists", "file_readable")
         )
-        any_failed = any(not o["passed"] for o in outcomes)
 
         if all_critical_passed:
             document.status = "Validated"
