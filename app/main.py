@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
@@ -57,7 +58,7 @@ def startup():
         # Apply any schema migrations for columns added after initial table creation
         with engine.connect() as conn:
             conn.execute(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS storage_key VARCHAR(500)"
+                text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS storage_key VARCHAR(500)")
             )
             conn.commit()
 
