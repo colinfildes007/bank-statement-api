@@ -60,6 +60,9 @@ def startup():
             conn.execute(
                 text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS storage_key VARCHAR(500)")
             )
+            conn.execute(
+                text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64)")
+            )
             conn.commit()
 
 
