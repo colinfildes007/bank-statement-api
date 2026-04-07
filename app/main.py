@@ -54,6 +54,12 @@ def _generate_job_id() -> str:
 def startup():
     if engine is not None:
         Base.metadata.create_all(bind=engine)
+        # Apply any schema migrations for columns added after initial table creation
+        with engine.connect() as conn:
+            conn.execute(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS storage_key VARCHAR(500)"
+            )
+            conn.commit()
 
 
 @app.get("/")
