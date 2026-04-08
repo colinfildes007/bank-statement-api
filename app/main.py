@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -64,7 +65,19 @@ def startup():
                 text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64)")
             )
             conn.execute(
+                text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS bucket_name VARCHAR(255)")
+            )
+            conn.execute(
+                text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS upload_timestamp TIMESTAMPTZ")
+            )
+            conn.execute(
                 text("ALTER TABLE processing_jobs ADD COLUMN IF NOT EXISTS requested_by VARCHAR(100)")
+            )
+            conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_primary VARCHAR(100)")
+            )
+            conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_secondary VARCHAR(100)")
             )
             conn.commit()
 
@@ -143,7 +156,9 @@ def _document_response(document: Document) -> dict:
         "file_size": document.file_size,
         "mime_type": document.mime_type,
         "storage_key": document.storage_key,
+        "bucket_name": document.bucket_name,
         "file_hash": document.file_hash,
+        "upload_timestamp": document.upload_timestamp,
         "status": document.status,
     }
 
@@ -200,6 +215,7 @@ async def upload_document(
 
     document_id = f"doc_{uuid4().hex[:8]}"
     storage_key = f"{case_id}/{document_id}/{original_filename}"
+    bucket_name = os.getenv("R2_BUCKET_NAME")
 
     upload_file_to_s3(file_bytes, storage_key, mime_type)
 
@@ -211,7 +227,9 @@ async def upload_document(
         file_size=file_size,
         mime_type=mime_type,
         storage_key=storage_key,
+        bucket_name=bucket_name,
         file_hash=file_hash,
+        upload_timestamp=datetime.now(timezone.utc),
         status="Uploaded",
     )
 

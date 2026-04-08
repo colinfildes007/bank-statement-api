@@ -685,6 +685,7 @@ def categorise_document_task(self, document_id: str, job_id: str):
         for txn in transactions:
             category, source, rule_id = apply_rules(db, txn)
             txn.category = category
+            txn.category_primary = category
             txn.category_source = source
             txn.rule_id = rule_id
 

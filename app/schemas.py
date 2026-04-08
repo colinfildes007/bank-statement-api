@@ -39,7 +39,9 @@ class DocumentResponse(BaseModel):
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
     storage_key: Optional[str] = None
+    bucket_name: Optional[str] = None
     file_hash: Optional[str] = None
+    upload_timestamp: Optional[datetime] = None
     status: str
 
     class Config:
@@ -166,6 +168,8 @@ class TransactionResponse(BaseModel):
     source_page_number: Optional[int] = None
     source_row_reference: Optional[str] = None
     category: Optional[str] = None
+    category_primary: Optional[str] = None
+    category_secondary: Optional[str] = None
     category_source: Optional[str] = None
     rule_id: Optional[str] = None
     needs_review: bool = False
