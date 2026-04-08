@@ -446,7 +446,7 @@ def resolve_exception(exception_id: str, payload: ExceptionActionRequest, db: Se
     if not exc:
         raise HTTPException(status_code=404, detail="Exception not found")
 
-    exc.status = "Resolved"
+    exc.status = "resolved"
     exc.resolved_at = datetime.now(timezone.utc)
     if payload.resolution_notes is not None:
         exc.resolution_notes = payload.resolution_notes
@@ -463,7 +463,7 @@ def dismiss_exception(exception_id: str, payload: ExceptionActionRequest, db: Se
     if not exc:
         raise HTTPException(status_code=404, detail="Exception not found")
 
-    exc.status = "Dismissed"
+    exc.status = "dismissed"
     exc.resolved_at = datetime.now(timezone.utc)
     if payload.resolution_notes is not None:
         exc.resolution_notes = payload.resolution_notes
