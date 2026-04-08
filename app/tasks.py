@@ -32,6 +32,8 @@ ALLOWED_MIME_TYPES = {
 
 ALLOWED_EXTENSIONS = {".pdf", ".csv", ".xls", ".xlsx", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
+SUPPORTED_SOURCE_TYPES = {"upload", "email", "api", "sftp", "manual"}
+
 KNOWN_BANKS = [
     "barclays", "hsbc", "lloyds", "natwest", "santander", "halifax",
     "nationwide", "monzo", "starling", "revolut", "metro bank", "first direct",
@@ -112,21 +114,23 @@ def _save_exception(db, document: Document, job_id: str, exception_type: str,
 
 
 def _fetch_file_from_s3(storage_key: str) -> bytes | None:
-    """Fetch raw file bytes from S3. Returns None on any error."""
-    bucket = os.getenv("AWS_S3_BUCKET")
+    """Fetch raw file bytes from R2/S3. Returns None on any error."""
+    bucket = os.getenv("R2_BUCKET_NAME")
+    endpoint_url = os.getenv("R2_ENDPOINT_URL")
     if not bucket or not storage_key:
         return None
     try:
         client = boto3.client(
             "s3",
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            endpoint_url=endpoint_url,
+            region_name=os.getenv("R2_REGION", "auto"),
+            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
         )
         response = client.get_object(Bucket=bucket, Key=storage_key)
         return response["Body"].read()
     except (BotoCoreError, ClientError) as exc:
-        logger.warning("S3 fetch failed for key %s: %s", storage_key, exc)
+        logger.warning("R2 fetch failed for key %s: %s", storage_key, exc)
         return None
 
 
@@ -135,7 +139,57 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
     outcomes = []
     file_bytes: bytes | None = None
 
-    # --- 1. file_exists ---
+    # --- 1. document_metadata_valid ---
+    has_filename = bool(document.original_filename and document.original_filename.strip())
+    has_source_type = bool(document.source_type and document.source_type.strip())
+    metadata_valid = has_filename and has_source_type
+    missing_fields = []
+    if not has_filename:
+        missing_fields.append("original_filename")
+    if not has_source_type:
+        missing_fields.append("source_type")
+    _save_validation_result(
+        db, document.document_id, job_id,
+        check_name="document_metadata_valid",
+        passed=metadata_valid,
+        severity="High",
+        result_code="METADATA_VALID" if metadata_valid else "METADATA_INCOMPLETE",
+        message="Required document metadata is present" if metadata_valid else f"Missing required fields: {', '.join(missing_fields)}",
+        details={"original_filename": document.original_filename, "source_type": document.source_type, "missing_fields": missing_fields},
+    )
+    if not metadata_valid:
+        _save_exception(
+            db, document, job_id,
+            exception_type="validation_failure",
+            severity="High",
+            title="Document metadata incomplete",
+            description=f"The following required fields are missing or blank: {', '.join(missing_fields)}.",
+        )
+    outcomes.append({"check": "document_metadata_valid", "passed": metadata_valid})
+
+    # --- 2. source_type_supported ---
+    source_type = (document.source_type or "").strip().lower()
+    source_supported = source_type in SUPPORTED_SOURCE_TYPES
+    _save_validation_result(
+        db, document.document_id, job_id,
+        check_name="source_type_supported",
+        passed=source_supported,
+        severity="Medium",
+        result_code="SOURCE_TYPE_SUPPORTED" if source_supported else "SOURCE_TYPE_UNSUPPORTED",
+        message=f"Source type '{source_type}' is supported" if source_supported else f"Source type '{source_type}' is not in the supported list",
+        details={"source_type": source_type, "supported_types": sorted(SUPPORTED_SOURCE_TYPES)},
+    )
+    if not source_supported:
+        _save_exception(
+            db, document, job_id,
+            exception_type="validation_failure",
+            severity="Medium",
+            title="Source type not supported",
+            description=f"Document source type '{source_type}' is not recognised. Supported types: {', '.join(sorted(SUPPORTED_SOURCE_TYPES))}.",
+        )
+    outcomes.append({"check": "source_type_supported", "passed": source_supported})
+
+    # --- 3. file_exists ---
     exists = bool(document.storage_key or document.file_size)
     _save_validation_result(
         db, document.document_id, job_id,
@@ -156,7 +210,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         )
     outcomes.append({"check": "file_exists", "passed": exists})
 
-    # --- 2. file_type_allowed ---
+    # --- 4. file_type_allowed ---
     ext = os.path.splitext(document.original_filename or "")[-1].lower()
     mime_ok = document.mime_type in ALLOWED_MIME_TYPES if document.mime_type else False
     ext_ok = ext in ALLOWED_EXTENSIONS
@@ -180,7 +234,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         )
     outcomes.append({"check": "file_type_allowed", "passed": type_allowed})
 
-    # --- 3. file_not_empty ---
+    # --- 5. file_not_empty ---
     not_empty = bool(document.file_size and document.file_size > 0)
     _save_validation_result(
         db, document.document_id, job_id,
@@ -201,7 +255,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         )
     outcomes.append({"check": "file_not_empty", "passed": not_empty})
 
-    # --- 4. file_readable (fetch from S3) ---
+    # --- 6. file_readable (fetch from R2) ---
     if document.storage_key:
         file_bytes = _fetch_file_from_s3(document.storage_key)
         readable = file_bytes is not None
@@ -220,7 +274,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
                 exception_type="validation_failure",
                 severity="Critical",
                 title="File could not be read from storage",
-                description=f"Attempt to read '{document.storage_key}' from S3 failed.",
+                description=f"Attempt to read '{document.storage_key}' from R2 failed.",
             )
         outcomes.append({"check": "file_readable", "passed": readable})
     else:
@@ -234,7 +288,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         )
         outcomes.append({"check": "file_readable", "passed": False})
 
-    # --- 5. page_count_detected (PDFs only) ---
+    # --- 7. page_count_detected (PDFs only) ---
     is_pdf = (document.mime_type == "application/pdf") or ext == ".pdf"
     if is_pdf and file_bytes:
         try:
@@ -287,7 +341,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
         )
         outcomes.append({"check": "page_count_detected", "passed": True, "skipped": True})
 
-    # --- 6. statement_date_range_present ---
+    # --- 8. statement_date_range_present ---
     extracted_text = ""
     if is_pdf and file_bytes:
         try:
@@ -314,7 +368,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
     )
     outcomes.append({"check": "statement_date_range_present", "passed": date_range_present if extracted_text else True})
 
-    # --- 7. bank_type_identified ---
+    # --- 9. bank_type_identified ---
     lower_text = extracted_text.lower() + " " + (document.original_filename or "").lower()
     matched_banks = [b for b in KNOWN_BANKS if b in lower_text]
     bank_identified = len(matched_banks) > 0
