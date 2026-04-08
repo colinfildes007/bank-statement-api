@@ -63,6 +63,9 @@ def startup():
             conn.execute(
                 text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64)")
             )
+            conn.execute(
+                text("ALTER TABLE processing_jobs ADD COLUMN IF NOT EXISTS requested_by VARCHAR(100)")
+            )
             conn.commit()
 
 
@@ -255,7 +258,7 @@ def validate_document(document_id: str, db: Session = Depends(get_db)):
         case_id=document.case_id,
         document_id=document_id,
         job_type="validate",
-        status="Pending",
+        status="queued",
     )
     db.add(job)
     db.commit()
@@ -266,7 +269,7 @@ def validate_document(document_id: str, db: Session = Depends(get_db)):
         "job_id": job_id,
         "document_id": document_id,
         "job_type": "validate",
-        "status": "Pending",
+        "status": "queued",
         "message": "Validation job queued"
     }
 
@@ -284,7 +287,7 @@ def extract_document(document_id: str, db: Session = Depends(get_db)):
         case_id=document.case_id,
         document_id=document_id,
         job_type="extract",
-        status="Pending",
+        status="queued",
     )
     db.add(job)
     db.commit()
@@ -295,7 +298,7 @@ def extract_document(document_id: str, db: Session = Depends(get_db)):
         "job_id": job_id,
         "document_id": document_id,
         "job_type": "extract",
-        "status": "Pending",
+        "status": "queued",
         "message": "Extraction job queued"
     }
 
@@ -313,7 +316,7 @@ def categorise_document(document_id: str, db: Session = Depends(get_db)):
         case_id=document.case_id,
         document_id=document_id,
         job_type="categorise",
-        status="Pending",
+        status="queued",
     )
     db.add(job)
     db.commit()
@@ -324,7 +327,7 @@ def categorise_document(document_id: str, db: Session = Depends(get_db)):
         "job_id": job_id,
         "document_id": document_id,
         "job_type": "categorise",
-        "status": "Pending",
+        "status": "queued",
         "message": "Categorisation job queued"
     }
 
@@ -352,7 +355,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     return job
 
 
-@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)], response_model=AiReportResponse, status_code=202)
+@app.post("/cases/{case_id}/reports/generate", dependencies=[Depends(verify_api_key)], response_model=ProcessingJobResponse, status_code=202)
 def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(get_db)):
     case = db.query(Case).filter(Case.case_id == case_id).first()
 
@@ -377,15 +380,15 @@ def generate_report(case_id: str, payload: ReportRequest, db: Session = Depends(
         case_id=case_id,
         document_id=None,
         job_type="generate_report",
-        status="Pending",
+        status="queued",
     )
     db.add(job)
     db.commit()
-    db.refresh(ai_report)
+    db.refresh(job)
 
     generate_report_task.delay(case_id, payload.report_type, job_id, report_id)
 
-    return ai_report
+    return job
 
 
 @app.get("/cases/{case_id}/reports", dependencies=[Depends(verify_api_key)], response_model=list[AiReportResponse])
@@ -759,7 +762,7 @@ def trigger_risk_flags(document_id: str, db: Session = Depends(get_db)):
         case_id=document.case_id,
         document_id=document_id,
         job_type="compute_risk_flags",
-        status="Pending",
+        status="queued",
     )
     db.add(job)
     db.commit()
@@ -770,7 +773,7 @@ def trigger_risk_flags(document_id: str, db: Session = Depends(get_db)):
         "job_id": job_id,
         "document_id": document_id,
         "job_type": "compute_risk_flags",
-        "status": "Pending",
+        "status": "queued",
         "message": "Risk flag computation job queued",
     }
 
