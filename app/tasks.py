@@ -51,7 +51,7 @@ DATE_PATTERN = re.compile(
 def _mark_job_started(db, job_id: str):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if job:
-        job.status = "Running"
+        job.status = "running"
         job.started_at = datetime.now(timezone.utc)
         db.commit()
     return job
@@ -60,7 +60,7 @@ def _mark_job_started(db, job_id: str):
 def _mark_job_completed(db, job_id: str, result: dict):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if job:
-        job.status = "Completed"
+        job.status = "completed"
         job.completed_at = datetime.now(timezone.utc)
         job.result_json = json.dumps(result)
         db.commit()
@@ -69,7 +69,7 @@ def _mark_job_completed(db, job_id: str, result: dict):
 def _mark_job_failed(db, job_id: str, error_code: str, error_message: str):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if job:
-        job.status = "Failed"
+        job.status = "failed"
         job.completed_at = datetime.now(timezone.utc)
         job.error_code = error_code
         job.error_message = error_message
@@ -338,7 +338,7 @@ def _run_checks(db, document: Document, job_id: str) -> list[dict]:
 def _mark_job_completed_with_warnings(db, job_id: str, result: dict):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if job:
-        job.status = "CompletedWithWarnings"
+        job.status = "completed"
         job.completed_at = datetime.now(timezone.utc)
         job.result_json = json.dumps(result)
         db.commit()

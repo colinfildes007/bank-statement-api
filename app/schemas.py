@@ -71,6 +71,7 @@ class ProcessingJobResponse(BaseModel):
     document_id: Optional[str] = None
     job_type: str
     status: str
+    requested_by: Optional[str] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
