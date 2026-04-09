@@ -1194,6 +1194,8 @@ def compute_risk_flags_task(self, document_id: str, job_id: str):
                 severity=fd["severity"],
                 title=fd["title"],
                 detail=fd.get("detail"),
+                metric_value=fd.get("metric_value"),
+                evidence_summary=fd.get("evidence_summary"),
             )
             db.add(flag)
 

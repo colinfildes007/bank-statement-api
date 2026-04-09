@@ -273,6 +273,8 @@ class RiskFlagResponse(BaseModel):
     severity: str
     title: str
     detail: Optional[str] = None
+    metric_value: Optional[Decimal] = None
+    evidence_summary: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:
