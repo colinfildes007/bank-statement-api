@@ -88,6 +88,7 @@ def _flag_gambling(transactions) -> list[dict]:
     flags = []
     for txn in transactions:
         if _GAMBLING_PATTERN.search(_text_fields(txn)):
+            amount = float(txn.amount if txn.amount is not None else (txn.debit if txn.debit is not None else 0))
             flags.append({
                 "transaction_id": txn.transaction_id,
                 "flag_type": "gambling",
@@ -97,6 +98,11 @@ def _flag_gambling(transactions) -> list[dict]:
                     f"Transaction '{txn.description_raw or txn.description_normalised}' "
                     f"on {txn.transaction_date} matched a known gambling pattern."
                 ),
+                "metric_value": amount,
+                "evidence_summary": (
+                    f"Gambling keyword matched in: '{txn.description_raw or txn.description_normalised}' "
+                    f"(amount: £{amount:.2f})"
+                ),
             })
     return flags
 
@@ -105,6 +111,7 @@ def _flag_payday_loans(transactions) -> list[dict]:
     flags = []
     for txn in transactions:
         if _PAYDAY_LOAN_PATTERN.search(_text_fields(txn)):
+            amount = float(txn.amount if txn.amount is not None else (txn.debit if txn.debit is not None else 0))
             flags.append({
                 "transaction_id": txn.transaction_id,
                 "flag_type": "payday_loan",
@@ -114,6 +121,11 @@ def _flag_payday_loans(transactions) -> list[dict]:
                     f"Transaction '{txn.description_raw or txn.description_normalised}' "
                     f"on {txn.transaction_date} matched a known payday-loan pattern."
                 ),
+                "metric_value": amount,
+                "evidence_summary": (
+                    f"Payday loan keyword matched in: '{txn.description_raw or txn.description_normalised}' "
+                    f"(amount: £{amount:.2f})"
+                ),
             })
     return flags
 
@@ -122,6 +134,7 @@ def _flag_returned_payments(transactions) -> list[dict]:
     flags = []
     for txn in transactions:
         if _RETURNED_PAYMENT_PATTERN.search(_text_fields(txn)):
+            amount = float(txn.amount if txn.amount is not None else (txn.debit if txn.debit is not None else 0))
             flags.append({
                 "transaction_id": txn.transaction_id,
                 "flag_type": "returned_payment",
@@ -131,6 +144,11 @@ def _flag_returned_payments(transactions) -> list[dict]:
                     f"Transaction '{txn.description_raw or txn.description_normalised}' "
                     f"on {txn.transaction_date} indicates a returned or failed payment."
                 ),
+                "metric_value": amount,
+                "evidence_summary": (
+                    f"Returned payment pattern matched in: '{txn.description_raw or txn.description_normalised}' "
+                    f"(amount: £{amount:.2f})"
+                ),
             })
     return flags
 
@@ -139,6 +157,7 @@ def _flag_overdraft_usage(transactions) -> list[dict]:
     flags = []
     for txn in transactions:
         if txn.balance is not None and txn.balance < 0:
+            balance = float(txn.balance)
             flags.append({
                 "transaction_id": txn.transaction_id,
                 "flag_type": "overdraft_usage",
@@ -147,6 +166,11 @@ def _flag_overdraft_usage(transactions) -> list[dict]:
                 "detail": (
                     f"Balance was {txn.balance} on {txn.transaction_date} "
                     f"after transaction '{txn.description_raw or txn.description_normalised}'."
+                ),
+                "metric_value": balance,
+                "evidence_summary": (
+                    f"Balance of £{balance:.2f} on {txn.transaction_date} "
+                    f"after: '{txn.description_raw or txn.description_normalised}'"
                 ),
             })
     return flags
@@ -188,6 +212,11 @@ def _flag_irregular_income(transactions) -> list[dict]:
             f"(coefficient of variation: {cv:.2f}, threshold: {_INCOME_CV_THRESHOLD}). "
             f"Average credit: £{avg:.2f}."
         ),
+        "metric_value": round(cv, 4),
+        "evidence_summary": (
+            f"Coefficient of variation {cv:.2f} (threshold {_INCOME_CV_THRESHOLD}) across "
+            f"{len(credits)} credit transactions; average credit £{avg:.2f}"
+        ),
     }]
 
 
@@ -227,6 +256,11 @@ def _flag_cash_heavy_behaviour(transactions) -> list[dict]:
         "detail": (
             f"{len(cash_txns)} of {len(debit_txns)} debit transactions "
             f"({ratio:.0%}) are cash withdrawals, totalling £{total_cash:.2f}."
+        ),
+        "metric_value": round(ratio, 4),
+        "evidence_summary": (
+            f"{len(cash_txns)} of {len(debit_txns)} debit transactions ({ratio:.0%}) "
+            f"are cash withdrawals; total cash withdrawn £{total_cash:.2f}"
         ),
     }]
 

@@ -232,6 +232,8 @@ class RiskFlag(Base):
     severity = Column(String(50), nullable=False, default="Medium")
     title = Column(String(255), nullable=False)
     detail = Column(Text, nullable=True)
+    metric_value = Column(Numeric(precision=18, scale=4), nullable=True)
+    evidence_summary = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
