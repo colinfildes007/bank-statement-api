@@ -7,6 +7,7 @@ from app.models import (
     CounterpartyRule,
     KeywordRule,
     ManualOverride,
+    MerchantAlias,
     MerchantRule,
     RegexRule,
     Transaction,
@@ -47,7 +48,24 @@ def _regex_flags(flags_str: Optional[str]) -> int:
     return flags
 
 
-def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Optional[str]]:
+def _resolve_canonical_name(transaction: Transaction, aliases: list) -> Optional[str]:
+    """
+    Resolve the transaction's description/merchant to a canonical merchant name
+    by checking the provided alias list.
+
+    Returns the first matching canonical_name, or None if no alias matches.
+    The caller is responsible for loading the alias list (once per batch) to
+    avoid repeated full table scans.
+    """
+    for alias in aliases:
+        if _text_matches(transaction.description_raw, alias.alias_name, "contains", alias.case_sensitive):
+            return alias.canonical_name
+        if _text_matches(transaction.merchant_name, alias.alias_name, "contains", alias.case_sensitive):
+            return alias.canonical_name
+    return None
+
+
+def apply_rules(db: Session, transaction: Transaction, aliases: Optional[list] = None) -> tuple[str, str, Optional[str]]:
     """Apply categorisation rules to a transaction in priority order.
 
     Priority:
@@ -57,6 +75,11 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
       4. Keyword rules    (default priority 200, matched against description and reference)
       5. Regex rules      (default priority 300, matched against description and reference)
       6. Default → "uncategorised"
+
+    Args:
+        aliases: Pre-loaded list of MerchantAlias rows. When processing many
+                 transactions in a batch, pass the list loaded once by the
+                 caller to avoid a DB query per transaction.
 
     Returns:
         (category_code, category_source, rule_id)
@@ -70,7 +93,13 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
     if override:
         return override.category, "manual", override.override_id
 
-    # 2. Merchant rules — match against description
+    # Resolve canonical merchant name via alias table.
+    # Use pre-loaded aliases if provided, otherwise load from DB.
+    if aliases is None:
+        aliases = db.query(MerchantAlias).all()
+    canonical_name = _resolve_canonical_name(transaction, aliases)
+
+    # 2. Merchant rules — match against description or resolved canonical name
     merchant_rules = (
         db.query(MerchantRule)
         .filter(MerchantRule.enabled.is_(True))
@@ -78,7 +107,10 @@ def apply_rules(db: Session, transaction: Transaction) -> tuple[str, str, Option
         .all()
     )
     for rule in merchant_rules:
-        if _text_matches(transaction.description_raw, rule.merchant_name, rule.match_type, rule.case_sensitive):
+        if (
+            _text_matches(transaction.description_raw, rule.merchant_name, rule.match_type, rule.case_sensitive) or
+            (canonical_name and _text_matches(canonical_name, rule.merchant_name, rule.match_type, rule.case_sensitive))
+        ):
             return rule.category, "merchant", rule.rule_id
 
     # 3. Counterparty rules — match against counterparty field

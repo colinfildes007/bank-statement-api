@@ -181,7 +181,21 @@ class TransactionResponse(BaseModel):
 
 # ── Categorisation rules ──────────────────────────────────────────────────────
 
-class MerchantRuleCreate(BaseModel):
+class MerchantAliasCreate(BaseModel):
+    alias_name: str
+    canonical_name: str
+    case_sensitive: bool = False
+
+
+class MerchantAliasResponse(MerchantAliasCreate):
+    alias_id: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+
     merchant_name: str
     category: str
     match_type: str = "contains"
@@ -276,6 +290,27 @@ class ManualOverrideCreate(BaseModel):
 class ManualOverrideResponse(ManualOverrideCreate):
     override_id: str
     transaction_id: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ── Rule suggestion ───────────────────────────────────────────────────────────
+
+class SuggestRuleRequest(BaseModel):
+    rule_type: str  # "merchant" | "keyword" | "regex" | "counterparty"
+    pattern: str
+    category: str
+    priority: Optional[int] = None
+
+
+class SuggestRuleResponse(BaseModel):
+    rule_type: str
+    rule_id: str
+    pattern: str
+    category: str
+    priority: int
     created_at: Optional[datetime] = None
 
     class Config:
