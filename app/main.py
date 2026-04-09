@@ -802,7 +802,6 @@ def suggest_rule(transaction_id: str, payload: SuggestRuleRequest, db: Session =
     priority = payload.priority if payload.priority is not None else RULE_TYPE_DEFAULTS[payload.rule_type]
 
     if payload.rule_type == "merchant":
-        import re as _re
         rule = MerchantRule(
             rule_id=f"mr_{uuid4().hex[:8]}",
             merchant_name=payload.pattern,

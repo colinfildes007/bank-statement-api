@@ -15,7 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.categorisation import apply_rules, UNRESOLVED_CATEGORIES
 from app.celery_app import celery_app
 from app.database import SessionLocal
-from app.models import Account, AiReport, Case, CaseException, Document, ProcessingJob, RiskFlag, Transaction, ValidationResult
+from app.models import Account, AiReport, Case, CaseException, Document, MerchantAlias, ProcessingJob, RiskFlag, Transaction, ValidationResult
 from app.risk_flags import compute_risk_flags
 
 logger = logging.getLogger(__name__)
@@ -695,8 +695,11 @@ def categorise_document_task(self, document_id: str, job_id: str):
         uncategorised_count = 0
         exceptions_created = 0
 
+        # Load merchant aliases once for the whole batch to avoid N DB queries
+        merchant_aliases = db.query(MerchantAlias).all()
+
         for txn in transactions:
-            category, source, rule_id = apply_rules(db, txn)
+            category, source, rule_id = apply_rules(db, txn, aliases=merchant_aliases)
             txn.category = category
             txn.category_primary = category
             txn.category_source = source
