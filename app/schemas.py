@@ -196,6 +196,7 @@ class MerchantAliasResponse(MerchantAliasCreate):
 
 
 
+class MerchantRuleCreate(BaseModel):
     merchant_name: str
     category: str
     match_type: str = "contains"
