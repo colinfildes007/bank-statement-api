@@ -551,12 +551,14 @@ def extract_document_task(self, document_id: str, job_id: str):
             db.add(txn)
             db.flush()
             saved_count += 1
+            _amount = float(txn_data.amount) if txn_data.amount is not None else None
             txn_list.append({
                 "transaction_id": transaction_id,
-                "direction": txn_data.direction,
-                "amount": float(txn_data.amount) if txn_data.amount is not None else None,
+                "date": txn_data.transaction_date.isoformat() if txn_data.transaction_date else None,
+                "description": txn_data.description_raw,
+                "debit": _amount if txn_data.direction == "debit" else None,
+                "credit": _amount if txn_data.direction == "credit" else None,
                 "balance": float(txn_data.balance) if txn_data.balance is not None else None,
-                "transaction_date": txn_data.transaction_date.isoformat() if txn_data.transaction_date else None,
             })
 
             if txn_data.extractor_confidence < CONFIDENCE_THRESHOLD:
@@ -669,6 +671,17 @@ def categorise_document_task(self, document_id: str, job_id: str):
         if not document:
             _mark_job_failed(db, job_id, "NOT_FOUND", "Document not found")
             raise ValueError(f"Document {document_id} not found")
+
+        EXTRACTION_COMPLETE_STATUSES = {"Extracted", "ExtractionWarning", "Categorised"}
+        if document.status not in EXTRACTION_COMPLETE_STATUSES:
+            _mark_job_failed(
+                db, job_id, "EXTRACTION_REQUIRED",
+                f"Document status is '{document.status}'. Categorisation requires extraction to complete first "
+                f"(expected one of: {', '.join(sorted(EXTRACTION_COMPLETE_STATUSES))}).",
+            )
+            raise ValueError(
+                f"Document {document_id} has not been extracted yet (status: {document.status})"
+            )
 
         _mark_job_started(db, job_id)
 

@@ -12,7 +12,7 @@ from app.auth import verify_api_key
 from app.database import Base, engine, get_db
 from app.models import (
     Account, AiReport, Case, CaseException, CounterpartyRule, Document,
-    KeywordRule, ManualOverride, MerchantRule, ProcessingJob,
+    KeywordRule, ManualOverride, MerchantAlias, MerchantRule, ProcessingJob,
     RegexRule, RiskFlag, Transaction, ValidationResult,
     CATEGORIES, CATEGORY_CODES,
 )
@@ -22,9 +22,11 @@ from app.schemas import (
     DocumentRegister, ExceptionResponse, ExceptionActionRequest,
     KeywordRuleCreate, KeywordRuleResponse,
     ManualOverrideCreate, ManualOverrideResponse,
+    MerchantAliasCreate, MerchantAliasResponse,
     MerchantRuleCreate, MerchantRuleResponse,
     ProcessingJobResponse, RegexRuleCreate, RegexRuleResponse,
-    ReportRequest, RiskFlagResponse, TransactionResponse, ValidationResultResponse,
+    ReportRequest, RiskFlagResponse, SuggestRuleRequest, SuggestRuleResponse,
+    TransactionResponse, ValidationResultResponse,
 )
 from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3, is_r2_configured
 from app.storage import MAX_UPLOAD_SIZE
@@ -761,6 +763,151 @@ def delete_manual_override(transaction_id: str, db: Session = Depends(get_db)):
     if not override:
         raise HTTPException(status_code=404, detail="No manual override found for this transaction")
     db.delete(override)
+    db.commit()
+
+
+# ── Rule suggestion ───────────────────────────────────────────────────────────
+
+RULE_TYPE_DEFAULTS = {
+    "merchant": 100,
+    "keyword": 200,
+    "regex": 300,
+    "counterparty": 150,
+}
+
+
+@app.post("/transactions/{transaction_id}/suggest-rule", dependencies=[Depends(verify_api_key)], response_model=SuggestRuleResponse, status_code=201)
+def suggest_rule(transaction_id: str, payload: SuggestRuleRequest, db: Session = Depends(get_db)):
+    """Create a categorisation rule suggested from reviewing a specific transaction.
+
+    rule_type must be one of: merchant, keyword, regex, counterparty.
+    This allows analysts to codify a reusable rule directly from a manual review
+    without a separate admin workflow.
+    """
+    txn = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if payload.rule_type not in RULE_TYPE_DEFAULTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"rule_type must be one of: {', '.join(sorted(RULE_TYPE_DEFAULTS))}",
+        )
+    if payload.category not in CATEGORY_CODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid category '{payload.category}'. Valid codes: {sorted(CATEGORY_CODES)}",
+        )
+
+    priority = payload.priority if payload.priority is not None else RULE_TYPE_DEFAULTS[payload.rule_type]
+
+    if payload.rule_type == "merchant":
+        import re as _re
+        rule = MerchantRule(
+            rule_id=f"mr_{uuid4().hex[:8]}",
+            merchant_name=payload.pattern,
+            category=payload.category,
+            match_type="contains",
+            case_sensitive=False,
+            priority=priority,
+            enabled=True,
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        return SuggestRuleResponse(
+            rule_type="merchant", rule_id=rule.rule_id, pattern=rule.merchant_name,
+            category=rule.category, priority=rule.priority, created_at=rule.created_at,
+        )
+
+    if payload.rule_type == "keyword":
+        rule = KeywordRule(
+            rule_id=f"kr_{uuid4().hex[:8]}",
+            keyword=payload.pattern,
+            category=payload.category,
+            match_type="contains",
+            case_sensitive=False,
+            priority=priority,
+            enabled=True,
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        return SuggestRuleResponse(
+            rule_type="keyword", rule_id=rule.rule_id, pattern=rule.keyword,
+            category=rule.category, priority=rule.priority, created_at=rule.created_at,
+        )
+
+    if payload.rule_type == "counterparty":
+        rule = CounterpartyRule(
+            rule_id=f"cr_{uuid4().hex[:8]}",
+            counterparty=payload.pattern,
+            category=payload.category,
+            match_type="contains",
+            case_sensitive=False,
+            priority=priority,
+            enabled=True,
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        return SuggestRuleResponse(
+            rule_type="counterparty", rule_id=rule.rule_id, pattern=rule.counterparty,
+            category=rule.category, priority=rule.priority, created_at=rule.created_at,
+        )
+
+    # payload.rule_type == "regex"
+    import re as _re
+    try:
+        _re.compile(payload.pattern)
+    except _re.error as e:
+        raise HTTPException(status_code=422, detail=f"Invalid regex pattern: {e}")
+    rule = RegexRule(
+        rule_id=f"rr_{uuid4().hex[:8]}",
+        pattern=payload.pattern,
+        category=payload.category,
+        priority=priority,
+        enabled=True,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return SuggestRuleResponse(
+        rule_type="regex", rule_id=rule.rule_id, pattern=rule.pattern,
+        category=rule.category, priority=rule.priority, created_at=rule.created_at,
+    )
+
+
+# ── Merchant aliases ──────────────────────────────────────────────────────────
+
+@app.get("/rules/merchant-aliases", dependencies=[Depends(verify_api_key)], response_model=list[MerchantAliasResponse])
+def list_merchant_aliases(db: Session = Depends(get_db)):
+    """List all merchant alias mappings."""
+    return db.query(MerchantAlias).order_by(MerchantAlias.alias_name.asc()).all()
+
+
+@app.post("/rules/merchant-aliases", dependencies=[Depends(verify_api_key)], response_model=MerchantAliasResponse, status_code=201)
+def create_merchant_alias(payload: MerchantAliasCreate, db: Session = Depends(get_db)):
+    """Create a merchant alias that maps a raw description string to a canonical merchant name."""
+    alias = MerchantAlias(
+        alias_id=f"ma_{uuid4().hex[:8]}",
+        alias_name=payload.alias_name,
+        canonical_name=payload.canonical_name,
+        case_sensitive=payload.case_sensitive,
+    )
+    db.add(alias)
+    db.commit()
+    db.refresh(alias)
+    return alias
+
+
+@app.delete("/rules/merchant-aliases/{alias_id}", dependencies=[Depends(verify_api_key)], status_code=204)
+def delete_merchant_alias(alias_id: str, db: Session = Depends(get_db)):
+    """Delete a merchant alias mapping."""
+    alias = db.query(MerchantAlias).filter(MerchantAlias.alias_id == alias_id).first()
+    if not alias:
+        raise HTTPException(status_code=404, detail="Merchant alias not found")
+    db.delete(alias)
     db.commit()
 
 

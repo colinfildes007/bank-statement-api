@@ -162,6 +162,17 @@ class CounterpartyRule(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class MerchantAlias(Base):
+    __tablename__ = "merchant_aliases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alias_id = Column(String(100), unique=True, index=True, nullable=False)
+    alias_name = Column(String(500), nullable=False)
+    canonical_name = Column(String(255), nullable=False)
+    case_sensitive = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class ManualOverride(Base):
     __tablename__ = "manual_overrides"
 
