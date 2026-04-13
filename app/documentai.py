@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID")
 GOOGLE_LOCATION = os.getenv("GOOGLE_LOCATION", "us")
 GOOGLE_DOCAI_PROCESSOR_ID = os.getenv("GOOGLE_DOCAI_PROCESSOR_ID")
+# Optional: pin to a specific trained processor version (e.g. a deployed custom extractor).
+# When unset, the processor's default (stable) version is used.
+GOOGLE_DOCAI_PROCESSOR_VERSION = os.getenv("GOOGLE_DOCAI_PROCESSOR_VERSION")
 
 # Transactions with extractor confidence below this threshold trigger an exception.
 CONFIDENCE_THRESHOLD = Decimal(str(os.getenv("DOCAI_CONFIDENCE_THRESHOLD", "0.8")))
@@ -138,8 +141,12 @@ def process_document(file_bytes: bytes, mime_type: str) -> ExtractionResult:
 
     Optional
     --------
+    GOOGLE_DOCAI_PROCESSOR_VERSION    Specific trained processor version to call.
+                                      When unset, the processor's default stable
+                                      version is used.  Required when using a
+                                      custom extractor with a trained version.
     GOOGLE_SERVICE_ACCOUNT_KEY_JSON   Inline JSON service-account key
-    GOOGLE_APPLICATION_CREDENTIALS   Path to a service-account key file
+    GOOGLE_APPLICATION_CREDENTIALS    Path to a service-account key file
     DOCAI_CONFIDENCE_THRESHOLD        Float in [0, 1]; default 0.8
     """
     if not GOOGLE_PROJECT_ID or not GOOGLE_DOCAI_PROCESSOR_ID:
@@ -147,19 +154,62 @@ def process_document(file_bytes: bytes, mime_type: str) -> ExtractionResult:
             "GOOGLE_PROJECT_ID and GOOGLE_DOCAI_PROCESSOR_ID must be set"
         )
 
+    if not file_bytes:
+        raise ValueError("file_bytes must not be empty")
+
     from google.cloud import documentai
 
     client = _get_processor_client()
-    processor_name = client.processor_path(
-        GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GOOGLE_DOCAI_PROCESSOR_ID
-    )
+
+    if GOOGLE_DOCAI_PROCESSOR_VERSION:
+        processor_name = client.processor_version_path(
+            GOOGLE_PROJECT_ID,
+            GOOGLE_LOCATION,
+            GOOGLE_DOCAI_PROCESSOR_ID,
+            GOOGLE_DOCAI_PROCESSOR_VERSION,
+        )
+        logger.info(
+            "Sending document to Document AI processor %s version %s (size=%d bytes, mime=%s)",
+            GOOGLE_DOCAI_PROCESSOR_ID,
+            GOOGLE_DOCAI_PROCESSOR_VERSION,
+            len(file_bytes),
+            mime_type,
+        )
+    else:
+        processor_name = client.processor_path(
+            GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GOOGLE_DOCAI_PROCESSOR_ID
+        )
+        logger.info(
+            "Sending document to Document AI processor %s (size=%d bytes, mime=%s)",
+            GOOGLE_DOCAI_PROCESSOR_ID,
+            len(file_bytes),
+            mime_type,
+        )
 
     raw_document = documentai.RawDocument(content=file_bytes, mime_type=mime_type)
     request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
 
-    logger.info("Sending document to Document AI processor %s", GOOGLE_DOCAI_PROCESSOR_ID)
     response = client.process_document(request=request)
     document = response.document
+
+    entity_count = len(document.entities) if document.entities else 0
+    doc_text_len = len(document.text) if document.text else 0
+    logger.info(
+        "Document AI response for processor %s: text_length=%d, entity_count=%d",
+        GOOGLE_DOCAI_PROCESSOR_ID,
+        doc_text_len,
+        entity_count,
+    )
+    if logger.isEnabledFor(logging.DEBUG) and entity_count:
+        entity_types = sorted({(e.type_ or "").lower() for e in document.entities})
+        logger.debug("Document AI entity types found: %s", entity_types)
+    if entity_count == 0:
+        logger.warning(
+            "Document AI returned 0 entities for processor %s. "
+            "Verify the processor ID, location, and processor version are correct, "
+            "and that the processor is enabled and has a deployed version.",
+            GOOGLE_DOCAI_PROCESSOR_ID,
+        )
 
     return _normalise_response(document)
 
