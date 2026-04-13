@@ -2,6 +2,8 @@ services:
   # FastAPI web service
   - type: web
     name: bank-statement-api
+    repo: https://github.com/colinfildes007/bank-statement-api
+    branch: main
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -28,6 +30,8 @@ services:
   # Celery background worker — picks up queued jobs from Redis
   - type: worker
     name: bank-statement-worker
+    repo: https://github.com/colinfildes007/bank-statement-api
+    branch: main
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=2
