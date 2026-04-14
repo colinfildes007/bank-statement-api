@@ -258,6 +258,30 @@ async def upload_document(
     return _document_response(document)
 
 
+@app.get("/documents/{document_id}", dependencies=[Depends(verify_api_key)])
+def get_document(document_id: str, db: Session = Depends(get_db)):
+    """Get a document record, enriched with account-level metadata when available.
+
+    Includes ``statement_start_date``, ``statement_end_date``, and
+    ``account_holder_name`` sourced from the linked Account so that callers
+    do not need a separate request to ``/documents/{id}/accounts``.
+    """
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    account = db.query(Account).filter(Account.document_id == document_id).first()
+
+    response = _document_response(document)
+    response.update({
+        "statement_start_date": account.statement_start_date if account else None,
+        "statement_end_date": account.statement_end_date if account else None,
+        "account_holder_name": account.account_holder_name if account else None,
+        "account_id": account.account_id if account else None,
+    })
+    return response
+
+
 @app.get("/documents/{document_id}/status", dependencies=[Depends(verify_api_key)])
 def get_document_status(document_id: str, db: Session = Depends(get_db)):
     document = db.query(Document).filter(Document.document_id == document_id).first()

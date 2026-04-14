@@ -49,6 +49,73 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Transaction-type classification helpers
+# ---------------------------------------------------------------------------
+
+# Ordered list of (compiled_pattern, transaction_type_value) pairs.
+# Patterns are checked against description_raw; first match wins.
+_TXN_TYPE_RULES = [
+    (re.compile(r"^\s*BGC\b", re.I), "bank_giro_credit"),
+    (re.compile(r"^\s*BACS\b", re.I), "bacs"),
+    (re.compile(r"^\s*SO\b", re.I), "standing_order"),
+    (re.compile(r"^\s*DD\b", re.I), "direct_debit"),
+    (re.compile(r"^\s*(?:FPS|FPO|FPI|FP)\b", re.I), "faster_payment"),
+    (re.compile(r"^\s*(?:TFR|TRANSFER)\b", re.I), "transfer"),
+    (re.compile(r"^\s*ATM\b", re.I), "atm"),
+    (re.compile(r"^\s*BP\b", re.I), "bill_payment"),
+    (re.compile(r"^\s*(?:CHQ|CHEQUE)\b", re.I), "cheque"),
+    (re.compile(r"^\s*(?:VIS|VISA|DEB|DEBIT CARD|POS)\b", re.I), "card_payment"),
+    (re.compile(r"^\s*INT\b", re.I), "interest"),
+    (re.compile(r"^\s*(?:REF|REFUND)\b", re.I), "refund"),
+    (re.compile(r"\b(?:SALARY|PAYROLL|WAGES)\b", re.I), "income"),
+    (re.compile(r"^\s*(?:RECEIVED\s+FROM|PAYMENT\s+FROM)\b", re.I), "credit"),
+    (re.compile(r"^\s*(?:CDT|CREDIT)\b", re.I), "credit"),
+]
+
+# Counterparty extraction: patterns applied in order; group(1) is the counterparty name.
+_COUNTERPARTY_PATTERNS = [
+    re.compile(r"^\s*(?:RECEIVED\s+FROM|FROM|PAYMENT\s+FROM)\s+(.+)", re.I),
+    re.compile(r"^\s*(?:PAYMENT\s+TO|TRANSFER\s+TO)\s+(.+)", re.I),
+    re.compile(r"^\s*BGC\s+(.+)", re.I),
+    re.compile(r"^\s*(?:FPS|FPI|FPO)\s+(.+)", re.I),
+    re.compile(r"^\s*DD\s+(.+)", re.I),
+    re.compile(r"^\s*SO\s+(.+)", re.I),
+    re.compile(r"^\s*BACS\s+(.+)", re.I),
+]
+
+# Reference-style suffixes to strip from extracted counterparty names
+_COUNTERPARTY_SUFFIX = re.compile(r"\s+(?:REF|REFERENCE)\s+\S+$|\s+\d{5,}$", re.I)
+
+
+def _classify_transaction_type(description_raw: str, direction: str) -> str:
+    """Return a transaction type code derived from the description prefix.
+
+    Falls back to ``"other"`` when no known code is detected.
+    """
+    if not description_raw:
+        return "other"
+    for pattern, txn_type in _TXN_TYPE_RULES:
+        if pattern.search(description_raw):
+            return txn_type
+    return "other"
+
+
+def _extract_counterparty_from_description(description_raw: str) -> "str | None":
+    """Best-effort extraction of a counterparty name from a raw transaction description.
+
+    Returns ``None`` when no known prefix pattern is matched.
+    """
+    if not description_raw:
+        return None
+    for pattern in _COUNTERPARTY_PATTERNS:
+        m = pattern.match(description_raw)
+        if m:
+            name = _COUNTERPARTY_SUFFIX.sub("", m.group(1)).strip()
+            if name:
+                return name
+    return None
+
 
 def _mark_job_started(db, job_id: str):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
@@ -553,8 +620,20 @@ def extract_document_task(self, document_id: str, job_id: str):
         txn_list = []
         for idx, txn_data in enumerate(extraction.transactions):
             transaction_id = f"txn_{uuid4().hex[:8]}"
+
+            # Classify transaction type from description when the extractor didn't supply one.
+            txn_type = _classify_transaction_type(
+                txn_data.description_raw or "", txn_data.direction or ""
+            )
+
+            # Derive counterparty name from description when the extractor didn't supply one.
+            counterparty = txn_data.counterparty_name or _extract_counterparty_from_description(
+                txn_data.description_raw
+            )
+
             txn = Transaction(
                 transaction_id=transaction_id,
+                case_id=document.case_id,
                 document_id=document_id,
                 account_id=account_id,
                 transaction_date=txn_data.transaction_date,
@@ -565,7 +644,8 @@ def extract_document_task(self, document_id: str, job_id: str):
                 amount=txn_data.amount,
                 balance=txn_data.balance,
                 merchant_name=txn_data.merchant_name,
-                counterparty_name=txn_data.counterparty_name,
+                counterparty_name=counterparty,
+                transaction_type=txn_type,
                 extractor_confidence=txn_data.extractor_confidence,
                 source_page_number=txn_data.source_page_number,
                 source_row_reference=str(idx + 1),

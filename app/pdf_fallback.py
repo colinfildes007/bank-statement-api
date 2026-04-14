@@ -25,12 +25,23 @@ logger = logging.getLogger(__name__)
 # Compiled patterns
 # ---------------------------------------------------------------------------
 
-# "01 Jan 2024" / "1 January 2024" (abbreviated or full month name)
+# "01 Jan 2024" / "1 January 2024" (abbreviated or full month name, 4-digit year)
 _DATE_LONG = re.compile(
     r"\b(\d{1,2})\s+"
     r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     r"\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+# "01 Jan 24" / "1 January 24" — 2-digit year format (e.g. Barclays statement headers)
+# Matched before _DATE_SHORT so the explicit year is captured rather than discarded.
+# Negative lookahead ensures we don't greedily consume the first 2 digits of a 4-digit year.
+_DATE_LONG_SHORT_YEAR = re.compile(
+    r"\b(\d{1,2})\s+"
+    r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+(\d{2})(?!\d)",
     re.IGNORECASE,
 )
 
@@ -40,7 +51,7 @@ _DATE_SHORT = re.compile(
     r"\b(\d{1,2})\s+"
     r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"(?!\s+\d{4})\b",
+    r"(?!\s+\d{2,4})\b",
     re.IGNORECASE,
 )
 
@@ -97,7 +108,30 @@ def _parse_date_long(m: re.Match) -> Optional[date]:
         return None
 
 
-def _parse_date_dmy(m: re.Match) -> Optional[date]:
+def _expand_year(raw_year: int) -> int:
+    """Convert a 2-digit year to a 4-digit year.
+
+    Years 00–49 → 2000–2049; years 50–99 → 1950–1999.
+    4-digit years are returned unchanged.
+    """
+    if raw_year < 100:
+        return 2000 + raw_year if raw_year < 50 else 1900 + raw_year
+    return raw_year
+
+
+def _parse_date_long_short_year(m: re.Match) -> Optional[date]:
+    """Parse a DD Mon YY match, expanding the 2-digit year to 4 digits."""
+    month = _MONTH_SHORT.get(m.group(2)[:3].lower())
+    if month is None:
+        return None
+    year = _expand_year(int(m.group(3)))
+    try:
+        return date(year, month, int(m.group(1)))
+    except ValueError:
+        return None
+
+
+
     try:
         return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
     except ValueError:
@@ -164,14 +198,20 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
         account.account_holder_name = m.group(0).strip()
 
     # Statement period: "1 January 2024 to 31 January 2024"
+    # Also handles abbreviated month names (e.g. "Jan") and 2-digit years (e.g. "20" → 2020)
+    # as seen in Barclays PDF headers.
     m = re.search(
         r"(\d{1,2})\s+"
         r"(January|February|March|April|May|June|July|August|"
-        r"September|October|November|December)\s+(\d{4})"
+        r"September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"\s+(\d{2,4})"
         r"\s+to\s+"
         r"(\d{1,2})\s+"
         r"(January|February|March|April|May|June|July|August|"
-        r"September|October|November|December)\s+(\d{4})",
+        r"September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"\s+(\d{2,4})",
         full_text, re.I,
     )
     if m:
@@ -179,9 +219,9 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
         em = _MONTH_SHORT.get(m.group(5)[:3].lower())
         try:
             if sm:
-                account.statement_start_date = date(int(m.group(3)), sm, int(m.group(1)))
+                account.statement_start_date = date(_expand_year(int(m.group(3))), sm, int(m.group(1)))
             if em:
-                account.statement_end_date = date(int(m.group(6)), em, int(m.group(4)))
+                account.statement_end_date = date(_expand_year(int(m.group(6))), em, int(m.group(4)))
         except ValueError:
             pass
 
@@ -278,16 +318,20 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             line = lines[i]
 
             dm_long = _DATE_LONG.match(line)
+            dm_long_yy = _DATE_LONG_SHORT_YEAR.match(line)
             dm_dmy = _DATE_DMY.match(line)
             dm_short = _DATE_SHORT.match(line)
 
-            # Try the named-month pattern first; fall back to DD/MM/YYYY; then
-            # the year-less short pattern used by Barclays statements.
+            # Try patterns in order of specificity: 4-digit year → 2-digit year →
+            # DD/MM/YYYY → year-less short format (Barclays).
             txn_date = None
             dm = None
             if dm_long:
                 txn_date = _parse_date_long(dm_long)
                 dm = dm_long
+            if txn_date is None and dm_long_yy:
+                txn_date = _parse_date_long_short_year(dm_long_yy)
+                dm = dm_long_yy
             if txn_date is None and dm_dmy:
                 txn_date = _parse_date_dmy(dm_dmy)
                 dm = dm_dmy
@@ -318,7 +362,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             j = i + 1
             while j < min(i + _MAX_LOOKAHEAD_LINES, len(lines)):
                 nxt = lines[j]
-                if _DATE_LONG.match(nxt) or _DATE_DMY.match(nxt) or _DATE_SHORT.match(nxt):
+                if _DATE_LONG.match(nxt) or _DATE_LONG_SHORT_YEAR.match(nxt) or _DATE_DMY.match(nxt) or _DATE_SHORT.match(nxt):
                     break
                 if re.search(
                     r"\b(?:opening|closing)\s+balance\b"
