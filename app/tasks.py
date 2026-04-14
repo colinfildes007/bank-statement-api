@@ -506,6 +506,28 @@ def extract_document_task(self, document_id: str, job_id: str):
         logger.info("Sending document %s to Document AI", document_id)
         extraction = process_document(file_bytes, mime_type)
 
+        # Fallback: if Document AI returned no transactions for a PDF, attempt
+        # text-based extraction so Barclays (and similar) column layouts are handled.
+        if not extraction.transactions and mime_type == "application/pdf":
+            logger.warning(
+                "Document AI returned 0 transactions for document %s; "
+                "attempting PDF text fallback parser.",
+                document_id,
+            )
+            from app.pdf_fallback import extract_from_pdf_text
+            fallback = extract_from_pdf_text(file_bytes)
+            if fallback.transactions:
+                logger.info(
+                    "PDF text fallback extracted %d transaction(s) for document %s",
+                    len(fallback.transactions), document_id,
+                )
+                extraction = fallback
+            else:
+                logger.warning(
+                    "PDF text fallback also returned 0 transactions for document %s",
+                    document_id,
+                )
+
         # 3. Persist Account
         account_id = f"acc_{uuid4().hex[:8]}"
         acct_data = extraction.account
