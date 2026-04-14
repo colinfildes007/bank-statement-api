@@ -84,11 +84,14 @@ _COUNTERPARTY_PATTERNS = [
     re.compile(r"^\s*BACS\s+(.+)", re.I),
 ]
 
-# Reference-style suffixes to strip from extracted counterparty names
-_COUNTERPARTY_SUFFIX = re.compile(r"\s+(?:REF|REFERENCE)\s+\S+$|\s+\d{5,}$", re.I)
+# Reference-style suffixes to strip from extracted counterparty names.
+# Only strip trailing text that is explicitly labelled as a reference (REF/REFERENCE).
+# Plain digit sequences are intentionally not stripped to avoid removing legitimate
+# numeric parts of counterparty names (e.g. "Shop 12345").
+_COUNTERPARTY_SUFFIX = re.compile(r"\s+(?:REF|REFERENCE)\s+\S+$", re.I)
 
 
-def _classify_transaction_type(description_raw: str, direction: str) -> str:
+def _classify_transaction_type(description_raw: str) -> str:
     """Return a transaction type code derived from the description prefix.
 
     Falls back to ``"other"`` when no known code is detected.
@@ -622,9 +625,7 @@ def extract_document_task(self, document_id: str, job_id: str):
             transaction_id = f"txn_{uuid4().hex[:8]}"
 
             # Classify transaction type from description when the extractor didn't supply one.
-            txn_type = _classify_transaction_type(
-                txn_data.description_raw or "", txn_data.direction or ""
-            )
+            txn_type = _classify_transaction_type(txn_data.description_raw or "")
 
             # Derive counterparty name from description when the extractor didn't supply one.
             counterparty = txn_data.counterparty_name or _extract_counterparty_from_description(
