@@ -127,6 +127,61 @@ def _normalise_description(raw: str) -> str:
     return re.sub(r"\s+", " ", raw).strip()
 
 
+def get_processor_info() -> dict:
+    """
+    Fetch metadata for the configured Document AI processor without processing
+    any document.  Returns a dict with keys:
+
+        configured          bool  – True if all required env vars are present
+        project_id          str | None
+        location            str
+        processor_id        str | None
+        processor_name      str | None  – display name reported by the API
+        processor_state     str | None  – e.g. "ENABLED"
+        processor_type      str | None  – e.g. "BANK_STATEMENT_PARSER"
+        error               str | None  – set when the API call fails
+    """
+    result: dict = {
+        "configured": bool(GOOGLE_PROJECT_ID and GOOGLE_DOCAI_PROCESSOR_ID),
+        "project_id": GOOGLE_PROJECT_ID,
+        "location": GOOGLE_LOCATION,
+        "processor_id": GOOGLE_DOCAI_PROCESSOR_ID,
+        "processor_name": None,
+        "processor_state": None,
+        "processor_type": None,
+        "error": None,
+    }
+
+    if not result["configured"]:
+        result["error"] = (
+            "GOOGLE_PROJECT_ID and GOOGLE_DOCAI_PROCESSOR_ID environment variables are not set"
+        )
+        return result
+
+    try:
+        from google.cloud import documentai
+
+        client = _get_processor_client()
+        processor_path = client.processor_path(
+            GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GOOGLE_DOCAI_PROCESSOR_ID
+        )
+        processor = client.get_processor(name=processor_path)
+        result["processor_name"] = processor.display_name or None
+        result["processor_state"] = processor.State(processor.state).name
+        result["processor_type"] = processor.type_ or None
+        logger.info(
+            "Document AI processor check OK: id=%s state=%s type=%s",
+            GOOGLE_DOCAI_PROCESSOR_ID,
+            result["processor_state"],
+            result["processor_type"],
+        )
+    except Exception as exc:  # pragma: no cover – network/auth errors
+        result["error"] = str(exc)
+        logger.warning("Document AI processor check failed: %s", exc)
+
+    return result
+
+
 def process_document(file_bytes: bytes, mime_type: str) -> ExtractionResult:
     """
     Send *file_bytes* to Google Document AI and return a normalised
