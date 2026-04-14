@@ -101,6 +101,16 @@ def health():
     }
 
 
+@app.get("/health/docai")
+def health_docai():
+    """Check connectivity to the configured Google Document AI processor."""
+    from app.documentai import get_processor_info
+
+    info = get_processor_info()
+    status = "ok" if (info["configured"] and info["error"] is None) else "error"
+    return {"status": status, **info}
+
+
 @app.post("/cases", dependencies=[Depends(verify_api_key)])
 def create_case(payload: CaseCreate, db: Session = Depends(get_db)):
     case_id = f"case_{uuid4().hex[:8]}"
