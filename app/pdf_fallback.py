@@ -56,6 +56,14 @@ _KNOWN_BANKS = [
 # reconciliation flags them for manual review.
 _TEXT_PARSE_CONFIDENCE = Decimal("0.75")
 
+# Maximum number of lines to collect after a date-headed line when building
+# a single transaction block (description + amounts may span several lines).
+_MAX_LOOKAHEAD_LINES = 6
+
+# Tolerance (in currency units) when checking whether a balance delta exactly
+# matches a transaction amount.  2p covers minor PDF rounding artefacts.
+_BALANCE_TOLERANCE = Decimal("0.02")
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -124,9 +132,11 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
         account.account_number_masked = m.group(1)
 
     # Account holder: title + name (restrict to same line with [ \t]+ to avoid
-    # crossing into adjacent header fields on the next line)
+    # crossing into adjacent header fields on the next line).
+    # Supports up to 5 additional name parts after the first to accommodate
+    # multi-part names (e.g. "Dr Jean-Pierre Van Der Berg").
     m = re.search(
-        r"(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][A-Za-z\-']+(?:[ \t]+[A-Z][A-Za-z\-']+){0,3})",
+        r"(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][A-Za-z\-']+(?:[ \t]+[A-Z][A-Za-z\-']+){0,5})",
         full_text,
     )
     if m:
@@ -215,14 +225,20 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             line = lines[i]
 
             dm_long = _DATE_LONG.match(line)
-            dm_dmy = _DATE_DMY.match(line) if not dm_long else None
-            dm = dm_long or dm_dmy
-            if dm is None:
-                i += 1
-                continue
+            dm_dmy = _DATE_DMY.match(line)
 
-            txn_date = _parse_date_long(dm_long) if dm_long else _parse_date_dmy(dm_dmy)
-            if txn_date is None:
+            # Try the named-month pattern first; fall back to DD/MM/YYYY if the
+            # named-month match exists but yields an invalid calendar date.
+            txn_date = None
+            dm = None
+            if dm_long:
+                txn_date = _parse_date_long(dm_long)
+                dm = dm_long
+            if txn_date is None and dm_dmy:
+                txn_date = _parse_date_dmy(dm_dmy)
+                dm = dm_dmy
+
+            if txn_date is None or dm is None:
                 i += 1
                 continue
 
@@ -232,7 +248,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             # Collect lookahead lines until the next date-headed line
             lookahead: List[str] = []
             j = i + 1
-            while j < min(i + 6, len(lines)):
+            while j < min(i + _MAX_LOOKAHEAD_LINES, len(lines)):
                 nxt = lines[j]
                 if _DATE_LONG.match(nxt) or _DATE_DMY.match(nxt):
                     break
@@ -254,6 +270,10 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             # Need at least 2 amounts to build a transaction (txn_amount + balance)
             if len(amounts) < 2:
                 if len(amounts) == 1 and prev_balance is None:
+                    logger.debug(
+                        "pdf_fallback: single amount %.2f on %s treated as initial balance",
+                        amounts[0], txn_date,
+                    )
                     prev_balance = amounts[0]
                 i = j if j > i + 1 else i + 1
                 continue
@@ -265,9 +285,9 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             direction: Optional[str] = None
             if prev_balance is not None:
                 delta = balance - prev_balance
-                if abs(delta - txn_amount) < Decimal("0.02"):
+                if abs(delta - txn_amount) < _BALANCE_TOLERANCE:
                     direction = "credit"
-                elif abs(delta + txn_amount) < Decimal("0.02"):
+                elif abs(delta + txn_amount) < _BALANCE_TOLERANCE:
                     direction = "debit"
                 else:
                     # Ambiguous — pick the sign of the delta as best guess
