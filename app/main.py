@@ -32,6 +32,7 @@ from app.storage import compute_sha256, delete_file_from_s3, upload_file_to_s3, 
 from app.storage import MAX_UPLOAD_SIZE
 from app.tasks import validate_document_task, extract_document_task, categorise_document_task, compute_risk_flags_task, generate_report_task
 from app.celery_app import celery_app
+from app.documentai import get_processor_info
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,6 @@ def health():
 @app.get("/health/docai")
 def health_docai():
     """Check connectivity to the configured Google Document AI processor."""
-    from app.documentai import get_processor_info
-
     info = get_processor_info()
     status = "ok" if (info["configured"] and info["error"] is None) else "error"
     return {"status": status, **info}
