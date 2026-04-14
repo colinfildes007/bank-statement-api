@@ -127,6 +127,23 @@ def _normalise_description(raw: str) -> str:
     return re.sub(r"\s+", " ", raw).strip()
 
 
+def _normalise_entity_type(raw_type: str) -> str:
+    """Strip processor-specific path prefixes and normalise an entity type string.
+
+    Google's Bank Statement Parser may prefix entity types with the processor
+    category (e.g. ``bank_statement/transaction``) or use alternative names
+    (e.g. ``line_item`` instead of ``transaction``).  This function strips
+    known prefixes so the rest of the normalisation code can work against a
+    flat, unambiguous type name.
+    """
+    t = (raw_type or "").lower().strip()
+    for prefix in ("bank_statement/", "statement/", "bank/"):
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+            break
+    return t
+
+
 def get_processor_info() -> dict:
     """
     Fetch metadata for the configured Document AI processor without processing
@@ -256,8 +273,8 @@ def process_document(file_bytes: bytes, mime_type: str) -> ExtractionResult:
         entity_count,
     )
     if logger.isEnabledFor(logging.DEBUG) and entity_count:
-        entity_types = sorted({(e.type_ or "").lower() for e in document.entities})
-        logger.debug("Document AI entity types found: %s", entity_types)
+        entity_types_raw = sorted({(e.type_ or "").lower() for e in document.entities})
+        logger.debug("Document AI entity types (raw): %s", entity_types_raw)
     if entity_count == 0:
         logger.warning(
             "Document AI returned 0 entities for processor %s. "
@@ -280,10 +297,13 @@ def _normalise_response(document) -> ExtractionResult:
       - account_number / account_number_masked
       - statement_start_date / period_start
       - statement_end_date / period_end
-      - opening_balance / start_balance
-      - closing_balance / end_balance
-      - transaction (parent entity with children: date, description,
-        debit_amount / credit_amount / amount, balance, type)
+      - opening_balance / start_balance / balance_brought_forward
+      - closing_balance / end_balance / balance_carried_forward
+      - transaction / line_item (parent entity with children: date, description,
+        debit_amount / credit_amount / amount / paid_out / paid_in, balance, type)
+
+    Entity types may be prefixed (e.g. ``bank_statement/transaction``) — the
+    prefix is stripped before matching via :func:`_normalise_entity_type`.
     """
     account = NormalisedAccount()
     transactions: list[NormalisedTransaction] = []
@@ -292,6 +312,8 @@ def _normalise_response(document) -> ExtractionResult:
     account_field_map = {
         "account_holder_name": "account_holder_name",
         "holder_name": "account_holder_name",
+        "account_name": "account_holder_name",
+        "customer_name": "account_holder_name",
         "bank_name": "bank_name",
         "sort_code": "sort_code",
         "routing_number": "sort_code",
@@ -299,16 +321,29 @@ def _normalise_response(document) -> ExtractionResult:
         "account_number_masked": "account_number_masked",
         "statement_start_date": "statement_start_date",
         "period_start": "statement_start_date",
+        "start_date": "statement_start_date",
+        "period_from": "statement_start_date",
         "statement_end_date": "statement_end_date",
         "period_end": "statement_end_date",
+        "end_date": "statement_end_date",
+        "period_to": "statement_end_date",
         "opening_balance": "opening_balance",
         "start_balance": "opening_balance",
+        "balance_brought_forward": "opening_balance",
+        "brought_forward": "opening_balance",
         "closing_balance": "closing_balance",
         "end_balance": "closing_balance",
+        "balance_carried_forward": "closing_balance",
+        "carried_forward": "closing_balance",
     }
 
+    # Log entity types at INFO level so production logs show what the processor returned
+    if document.entities:
+        entity_types = sorted({_normalise_entity_type(e.type_) for e in document.entities})
+        logger.info("Document AI entity types found (normalised): %s", entity_types)
+
     for entity in document.entities:
-        etype = (entity.type_ or "").lower().strip()
+        etype = _normalise_entity_type(entity.type_)
 
         if etype in account_field_map:
             field_name = account_field_map[etype]
@@ -320,7 +355,7 @@ def _normalise_response(document) -> ExtractionResult:
             else:
                 setattr(account, field_name, raw)
 
-        elif etype == "transaction":
+        elif etype in ("transaction", "line_item"):
             txn = _parse_transaction_entity(entity)
             transactions.append(txn)
 
@@ -341,16 +376,29 @@ def _parse_transaction_entity(entity) -> NormalisedTransaction:
         "description": "description_raw",
         "narrative": "description_raw",
         "details": "description_raw",
+        "text": "description_raw",
+        "payment_details": "description_raw",
         "debit_amount": "__debit",
         "credit_amount": "__credit",
         "amount": "__amount",
+        "transaction_amount": "__amount",
+        "paid_out": "__debit",
+        "money_out": "__debit",
+        "withdrawal_amount": "__debit",
+        "paid_in": "__credit",
+        "money_in": "__credit",
+        "deposit_amount": "__credit",
         "balance": "balance",
         "running_balance": "balance",
+        "account_balance": "balance",
         "type": "__direction",
         "direction": "__direction",
+        "payment_type": "__direction",
+        "transaction_type": "__direction",
         "merchant_name": "merchant_name",
         "counterparty_name": "counterparty_name",
         "counterparty": "counterparty_name",
+        "payee": "counterparty_name",
     }
 
     debit_amount: Optional[float] = None
@@ -359,7 +407,7 @@ def _parse_transaction_entity(entity) -> NormalisedTransaction:
     raw_direction: Optional[str] = None
 
     for child in entity.properties:
-        ctype = (child.type_ or "").lower().strip()
+        ctype = _normalise_entity_type(child.type_)
         raw = _entity_text(child)
         target = child_map.get(ctype)
 

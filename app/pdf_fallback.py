@@ -11,7 +11,7 @@ are flagged for human review but do not block downstream processing.
 import io
 import logging
 import re
-from datetime import date
+from datetime import date, datetime as _dt
 from decimal import Decimal, InvalidOperation
 from typing import List, Optional, Tuple
 
@@ -31,6 +31,16 @@ _DATE_LONG = re.compile(
     r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     r"\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+# "01 Jan" / "1 January" — year-less date (common in Barclays statements)
+# Negative lookahead prevents matching the prefix of a full "01 Jan 2024" date.
+_DATE_SHORT = re.compile(
+    r"\b(\d{1,2})\s+"
+    r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"(?!\s+\d{4})\b",
     re.IGNORECASE,
 )
 
@@ -90,6 +100,17 @@ def _parse_date_long(m: re.Match) -> Optional[date]:
 def _parse_date_dmy(m: re.Match) -> Optional[date]:
     try:
         return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _parse_date_short(m: re.Match, year: int) -> Optional[date]:
+    """Parse a year-less date match (day + month name) using *year*."""
+    month = _MONTH_SHORT.get(m.group(2)[:3].lower())
+    if month is None:
+        return None
+    try:
+        return date(year, month, int(m.group(1)))
     except ValueError:
         return None
 
@@ -164,12 +185,18 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
         except ValueError:
             pass
 
-    # Explicit opening / closing balance labels
-    m = re.search(r"[Oo]pening\s+[Bb]alance\s+[£]?([\d,]+\.\d{2})", full_text)
+    # Explicit opening / closing balance labels.
+    # Try Barclays-specific wording first ("Balance Brought/Carried Forward"),
+    # then fall back to generic labels.
+    m = re.search(r"[Bb]alance\s+[Bb]rought\s+[Ff]orward\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Oo]pening\s+[Bb]alance\s*[£]?([\d,]+\.\d{2})", full_text)
     if m:
         account.opening_balance = _parse_decimal(m.group(1))
 
-    m = re.search(r"[Cc]losing\s+[Bb]alance\s+[£]?([\d,]+\.\d{2})", full_text)
+    m = re.search(r"[Bb]alance\s+[Cc]arried\s+[Ff]orward\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Cc]losing\s+[Bb]alance\s*[£]?([\d,]+\.\d{2})", full_text)
     if m:
         account.closing_balance = _parse_decimal(m.group(1))
 
@@ -187,11 +214,15 @@ def _parse_generic_metadata(full_text: str) -> NormalisedAccount:
             account.bank_name = bank.title()
             break
 
-    m = re.search(r"[Oo]pening\s+[Bb]alance\s+[£]?([\d,]+\.\d{2})", full_text)
+    m = re.search(r"[Bb]alance\s+[Bb]rought\s+[Ff]orward\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Oo]pening\s+[Bb]alance\s*[£]?([\d,]+\.\d{2})", full_text)
     if m:
         account.opening_balance = _parse_decimal(m.group(1))
 
-    m = re.search(r"[Cc]losing\s+[Bb]alance\s+[£]?([\d,]+\.\d{2})", full_text)
+    m = re.search(r"[Bb]alance\s+[Cc]arried\s+[Ff]orward\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Cc]losing\s+[Bb]alance\s*[£]?([\d,]+\.\d{2})", full_text)
     if m:
         account.closing_balance = _parse_decimal(m.group(1))
 
@@ -208,15 +239,37 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
     Strategy
     --------
     1. Scan lines for those that *start* with a recognisable date token.
+       Supported formats: "01 Jan 2024" (long), "01/01/2024" (DMY), and
+       "01 Jan" (short / year-less — common in Barclays statements).
     2. For each date-headed block (the date line plus following lines up to
        the next date), collect all monetary amounts.
     3. Interpret: last amount = running balance; penultimate = transaction
        amount (money out / money in).
     4. Infer direction (debit / credit) from whether the running balance
        went up (+credit) or down (+debit) relative to the previous row.
+
+    Year inference for short dates
+    --------------------------------
+    When a date has no year (Barclays "DD Mon" format), the year is inferred
+    from ``account.statement_start_date`` (if available) or the current year.
+    If the month number drops by more than one compared with the most recently
+    seen month, the year is incremented to handle statement periods that cross
+    a calendar year boundary (e.g. Dec → Jan).
     """
     transactions: List[NormalisedTransaction] = []
     prev_balance: Optional[Decimal] = account.opening_balance
+
+    # Year used when parsing short ("DD Mon") dates
+    inferred_year: int = (
+        account.statement_start_date.year
+        if account.statement_start_date
+        else _dt.today().year
+    )
+    last_month: Optional[int] = (
+        account.statement_start_date.month
+        if account.statement_start_date
+        else None
+    )
 
     for page_num, page_text in enumerate(pages, start=1):
         lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
@@ -226,9 +279,10 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
 
             dm_long = _DATE_LONG.match(line)
             dm_dmy = _DATE_DMY.match(line)
+            dm_short = _DATE_SHORT.match(line)
 
-            # Try the named-month pattern first; fall back to DD/MM/YYYY if the
-            # named-month match exists but yields an invalid calendar date.
+            # Try the named-month pattern first; fall back to DD/MM/YYYY; then
+            # the year-less short pattern used by Barclays statements.
             txn_date = None
             dm = None
             if dm_long:
@@ -237,20 +291,40 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             if txn_date is None and dm_dmy:
                 txn_date = _parse_date_dmy(dm_dmy)
                 dm = dm_dmy
+            if txn_date is None and dm_short:
+                # Detect year rollover: any backward month transition on a
+                # chronological statement means we have crossed into a new year.
+                month = _MONTH_SHORT.get(dm_short.group(2)[:3].lower())
+                if month is not None and last_month is not None and month < last_month:
+                    inferred_year += 1
+                txn_date = _parse_date_short(dm_short, inferred_year)
+                dm = dm_short
 
             if txn_date is None or dm is None:
                 i += 1
                 continue
 
+            # Track last seen month for year rollover detection on subsequent rows
+            last_month = txn_date.month
+
             # Rest of the date line (description + possible amounts)
             rest = line[dm.end():].strip()
 
-            # Collect lookahead lines until the next date-headed line
+            # Collect lookahead lines until the next date-headed line or a
+            # balance-marker line (e.g. "Balance Carried Forward …").  Stopping
+            # at balance markers prevents their monetary amounts from being
+            # mistaken for part of the preceding transaction.
             lookahead: List[str] = []
             j = i + 1
             while j < min(i + _MAX_LOOKAHEAD_LINES, len(lines)):
                 nxt = lines[j]
-                if _DATE_LONG.match(nxt) or _DATE_DMY.match(nxt):
+                if _DATE_LONG.match(nxt) or _DATE_DMY.match(nxt) or _DATE_SHORT.match(nxt):
+                    break
+                if re.search(
+                    r"\b(?:opening|closing)\s+balance\b"
+                    r"|\bbalance\s+(?:brought|carried)\s+forward\b",
+                    nxt, re.I,
+                ):
                     break
                 lookahead.append(nxt)
                 j += 1
@@ -259,11 +333,23 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             amounts = _amounts_in(combined)
             desc = _strip_amounts(combined) or None
 
-            # "Opening balance" row — treat as account-level metadata, not a transaction
-            if re.search(r"\bopening\s+balance\b", combined, re.I):
+            # "Opening balance" / "Balance Brought Forward" row — treat as
+            # account-level metadata, not a transaction.  Check only the
+            # date-line's own content (rest), not the lookahead, to avoid
+            # consuming a real transaction whose next line happens to mention
+            # a balance label (e.g. "Balance Carried Forward" summary row).
+            if re.search(r"\bopening\s+balance\b|\bbalance\s+brought\s+forward\b", rest, re.I):
                 if amounts and account.opening_balance is None:
                     account.opening_balance = amounts[-1]
                 prev_balance = account.opening_balance or (amounts[-1] if amounts else None)
+                i = j if j > i + 1 else i + 1
+                continue
+
+            # "Balance Carried Forward" row — record as closing balance metadata.
+            if re.search(r"\bbalance\s+carried\s+forward\b", rest, re.I):
+                if amounts and account.closing_balance is None:
+                    account.closing_balance = amounts[-1]
+                prev_balance = amounts[-1] if amounts else prev_balance
                 i = j if j > i + 1 else i + 1
                 continue
 
