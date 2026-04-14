@@ -41,12 +41,13 @@ services:
       - key: OPENAI_API_KEY
         sync: false
 
-  # Celery background worker — picks up queued jobs from Redis
+  # Celery background worker — picks up queued jobs from Redis (Virginia / US East)
   - type: worker
-    name: bank-statement-worker
+    name: bank-statement-api-workerV2
     repo: https://github.com/colinfildes007/bank-statement-api
     branch: main
     runtime: python
+    region: virginia
     buildCommand: pip install -r requirements.txt
     startCommand: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=2
     envVars:
