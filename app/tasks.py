@@ -188,6 +188,9 @@ def _extract_counterparty_from_description(description_raw: str) -> "str | None"
 # Maps internal check/source names to the agreed exception_type enum values.
 # Agreed enum: validation | extraction | categorisation | reconciliation |
 #              risk_flag | review_required | system_error
+# Note: risk_flag is produced by the risk-flag engine (compute_risk_flags_task)
+# and is persisted directly into the risk_flags table, not as a CaseException,
+# so it does not appear in this map.
 _EXCEPTION_TYPE_MAP: dict[str, str] = {
     # Validation pipeline
     "validation_failure": "validation",

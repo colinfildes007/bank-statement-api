@@ -55,6 +55,10 @@ def _generate_job_id() -> str:
     return f"job_{uuid4().hex[:8]}"
 
 
+# Ordered severity levels used to filter exceptions by minimum severity.
+_SEVERITY_RANK: dict[str, int] = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
+
+
 @app.on_event("startup")
 def startup():
     if engine is not None:
@@ -552,10 +556,9 @@ def get_case_exceptions(
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    severity_rank = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
-    threshold = severity_rank.get(min_severity, 1)
+    threshold = _SEVERITY_RANK.get(min_severity, 1)
     all_exceptions = db.query(CaseException).filter(CaseException.case_id == case_id).all()
-    return [e for e in all_exceptions if severity_rank.get(e.severity, 0) >= threshold]
+    return [e for e in all_exceptions if _SEVERITY_RANK.get(e.severity, 0) >= threshold]
 
 
 @app.get("/documents/{document_id}/validation-results", dependencies=[Depends(verify_api_key)], response_model=list[ValidationResultResponse])
@@ -586,8 +589,9 @@ def get_document_exceptions(
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    severity_rank = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
-    threshold = severity_rank.get(min_severity, 1)
+    threshold = _SEVERITY_RANK.get(min_severity, 1)
+    all_exceptions = db.query(CaseException).filter(CaseException.document_id == document_id).all()
+    return [e for e in all_exceptions if _SEVERITY_RANK.get(e.severity, 0) >= threshold]
     all_exceptions = db.query(CaseException).filter(CaseException.document_id == document_id).all()
     return [e for e in all_exceptions if severity_rank.get(e.severity, 0) >= threshold]
 
