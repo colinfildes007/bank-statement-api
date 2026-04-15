@@ -16,6 +16,27 @@ from app.models import (
 # Categories that indicate a transaction could not be resolved
 UNRESOLVED_CATEGORIES = {"uncategorised", "unknown", "needs_review"}
 
+# Fallback category derived from the transaction_type field (set during extraction
+# from payment-prefix codes such as DD, BGC, SO).  Applied after all rule-based
+# matching fails so that transactions without an explicit rule still receive a
+# meaningful primary category.  Values must match CATEGORY_CODES in models.py.
+_TRANSACTION_TYPE_CATEGORY: dict[str, str] = {
+    "bank_giro_credit": "income",
+    "bacs": "income",
+    "income": "income",
+    "credit": "income",
+    "direct_debit": "household_bills",
+    "standing_order": "household_bills",
+    "bill_payment": "household_bills",
+    "card_payment": "everyday_spending",
+    "atm": "financial_banking",
+    "faster_payment": "financial_banking",
+    "transfer": "financial_banking",
+    "cheque": "financial_banking",
+    "interest": "financial_banking",
+    "refund": "financial_banking",
+}
+
 
 def _text_matches(text: Optional[str], pattern: str, match_type: str, case_sensitive: bool) -> bool:
     """Return True if text matches the given pattern according to match_type."""
@@ -72,9 +93,12 @@ def apply_rules(db: Session, transaction: Transaction, aliases: Optional[list] =
       1. Manual override (highest)
       2. Merchant rules   (default priority 100, matched against description)
       3. Counterparty rules (default priority 150, matched against counterparty)
-      4. Keyword rules    (default priority 200, matched against description and reference)
+      4. Keyword rules    (default priority 200, matched against description,
+                           description_normalised, reference, and counterparty_name)
       5. Regex rules      (default priority 300, matched against description and reference)
-      6. Default → "uncategorised"
+      6. Transaction-type fallback — derived from the payment-code prefix
+         (e.g. DD → household_bills, BGC → income) without any DB queries.
+      7. Default → "uncategorised"
 
     Args:
         aliases: Pre-loaded list of MerchantAlias rows. When processing many
@@ -129,16 +153,24 @@ def apply_rules(db: Session, transaction: Transaction, aliases: Optional[list] =
         ):
             return rule.category, "counterparty", rule.rule_id
 
-    # 4. Keyword rules — match against description or reference
+    # 4. Keyword rules — match against description (raw + normalised), reference,
+    #    and counterparty_name so that transactions where the payment-type prefix
+    #    has been stripped (e.g. DocumentAI returns "VODAFONE" rather than
+    #    "DD VODAFONE") can still be matched via the counterparty field.
     keyword_rules = (
         db.query(KeywordRule)
         .filter(KeywordRule.enabled.is_(True))
         .order_by(KeywordRule.priority.asc())
         .all()
     )
+    counterparty_text = transaction.counterparty_name or transaction.counterparty
     for rule in keyword_rules:
-        if _text_matches(transaction.description_raw, rule.keyword, rule.match_type, rule.case_sensitive) or \
-                _text_matches(transaction.reference, rule.keyword, rule.match_type, rule.case_sensitive):
+        if (
+            _text_matches(transaction.description_raw, rule.keyword, rule.match_type, rule.case_sensitive)
+            or _text_matches(transaction.description_normalised, rule.keyword, rule.match_type, rule.case_sensitive)
+            or _text_matches(transaction.reference, rule.keyword, rule.match_type, rule.case_sensitive)
+            or _text_matches(counterparty_text, rule.keyword, rule.match_type, rule.case_sensitive)
+        ):
             return rule.category, "keyword", rule.rule_id
 
     # 5. Regex rules — match against description or reference
@@ -158,5 +190,13 @@ def apply_rules(db: Session, transaction: Transaction, aliases: Optional[list] =
             # Skip rules with invalid regex patterns
             continue
 
-    # 6. Default
+    # 6. Transaction-type fallback — uses the payment-code prefix that was
+    #    classified during extraction (e.g. DD → direct_debit → household_bills).
+    #    This ensures good coverage even when no explicit rule matches.
+    if transaction.transaction_type:
+        fallback_cat = _TRANSACTION_TYPE_CATEGORY.get(transaction.transaction_type)
+        if fallback_cat:
+            return fallback_cat, "transaction_type", None
+
+    # 7. Default
     return "uncategorised", "default", None

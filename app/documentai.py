@@ -76,10 +76,22 @@ def _get_processor_client():
 
 def _parse_date(value: str) -> Optional[date]:
     """Try date formats in order of specificity: ISO 8601 first, then unambiguous
-    locale formats, then potentially ambiguous ones (%m/%d/%Y last)."""
+    locale formats, then potentially ambiguous ones (%m/%d/%Y last).
+
+    2-digit years are handled via Python's ``%y`` directive: 00–68 → 2000–2068,
+    69–99 → 1969–1999.  This is consistent with the ``_expand_year`` function
+    used by the PDF fallback parser.
+    """
     if not value:
         return None
-    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%d %b %Y", "%d %B %Y",
+        "%d-%m-%Y", "%d/%m/%Y",
+        "%d %b %y", "%d %B %y",
+        "%d-%m-%y", "%d/%m/%y",
+        "%m/%d/%Y",
+    ):
         try:
             from datetime import datetime as dt
 
@@ -87,6 +99,22 @@ def _parse_date(value: str) -> Optional[date]:
         except ValueError:
             continue
     return None
+
+
+def _parse_entity_date(entity) -> Optional[date]:
+    """Return a :class:`~datetime.date` for a Document AI entity.
+
+    Tries ``entity.normalized_value.date_value`` first (Google's own structured
+    parse, most reliable) and falls back to parsing ``mention_text`` via
+    :func:`_parse_date` when the normalized value is absent or incomplete.
+    """
+    try:
+        dv = entity.normalized_value.date_value
+        if dv and dv.year and dv.month and dv.day:
+            return date(dv.year, dv.month, dv.day)
+    except (AttributeError, ValueError):
+        pass
+    return _parse_date(_entity_text(entity))
 
 
 def _parse_amount(value: str) -> Optional[Decimal]:
@@ -347,13 +375,12 @@ def _normalise_response(document) -> ExtractionResult:
 
         if etype in account_field_map:
             field_name = account_field_map[etype]
-            raw = _entity_text(entity)
             if field_name.endswith("_date"):
-                setattr(account, field_name, _parse_date(raw))
+                setattr(account, field_name, _parse_entity_date(entity))
             elif field_name.endswith("_balance"):
-                setattr(account, field_name, _parse_amount(raw))
+                setattr(account, field_name, _parse_amount(_entity_text(entity)))
             else:
-                setattr(account, field_name, raw)
+                setattr(account, field_name, _entity_text(entity))
 
         elif etype in ("transaction", "line_item"):
             txn = _parse_transaction_entity(entity)
@@ -422,7 +449,7 @@ def _parse_transaction_entity(entity) -> NormalisedTransaction:
         elif target == "__direction":
             raw_direction = raw
         elif target in ("transaction_date", "posting_date"):
-            setattr(txn, target, _parse_date(raw))
+            setattr(txn, target, _parse_entity_date(child))
         elif target == "balance":
             txn.balance = _parse_amount(raw)
         elif target == "description_raw":

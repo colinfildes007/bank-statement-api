@@ -262,7 +262,7 @@ def check_missing_lines(extracted_data: dict) -> list:
         if abs(balance_change - stated_change) > tolerance:
             findings.append(ReconciliationFinding(
                 check="missing_line_suspicion",
-                severity="High",
+                severity="Medium",
                 title=f"Unexplained balance change before transaction {txn_id}",
                 description=(
                     f"Balance changed by {balance_change:.2f} but the transaction "

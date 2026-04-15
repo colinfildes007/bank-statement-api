@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -53,6 +53,10 @@ app.add_middleware(
 
 def _generate_job_id() -> str:
     return f"job_{uuid4().hex[:8]}"
+
+
+# Ordered severity levels used to filter exceptions by minimum severity.
+_SEVERITY_RANK: dict[str, int] = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
 
 
 @app.on_event("startup")
@@ -535,13 +539,26 @@ def get_report(report_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/cases/{case_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
-def get_case_exceptions(case_id: str, db: Session = Depends(get_db)):
-    """List all exceptions for a case"""
+def get_case_exceptions(
+    case_id: str,
+    min_severity: str = Query(
+        default="Medium",
+        description=(
+            "Minimum severity level to include. One of: Low, Medium, High, Critical. "
+            "Defaults to Medium so that low-signal informational exceptions are hidden. "
+            "Pass min_severity=Low to retrieve all exceptions."
+        ),
+    ),
+    db: Session = Depends(get_db),
+):
+    """List exceptions for a case, filtered to *min_severity* and above."""
     case = db.query(Case).filter(Case.case_id == case_id).first()
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    return db.query(CaseException).filter(CaseException.case_id == case_id).all()
+    threshold = _SEVERITY_RANK.get(min_severity, 1)
+    all_exceptions = db.query(CaseException).filter(CaseException.case_id == case_id).all()
+    return [e for e in all_exceptions if _SEVERITY_RANK.get(e.severity, 0) >= threshold]
 
 
 @app.get("/documents/{document_id}/validation-results", dependencies=[Depends(verify_api_key)], response_model=list[ValidationResultResponse])
@@ -555,13 +572,28 @@ def get_document_validation_results(document_id: str, db: Session = Depends(get_
 
 
 @app.get("/documents/{document_id}/exceptions", dependencies=[Depends(verify_api_key)], response_model=list[ExceptionResponse])
-def get_document_exceptions(document_id: str, db: Session = Depends(get_db)):
-    """List all exceptions for a document"""
+def get_document_exceptions(
+    document_id: str,
+    min_severity: str = Query(
+        default="Medium",
+        description=(
+            "Minimum severity level to include. One of: Low, Medium, High, Critical. "
+            "Defaults to Medium so that low-signal informational exceptions are hidden. "
+            "Pass min_severity=Low to retrieve all exceptions."
+        ),
+    ),
+    db: Session = Depends(get_db),
+):
+    """List exceptions for a document, filtered to *min_severity* and above."""
     document = db.query(Document).filter(Document.document_id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    return db.query(CaseException).filter(CaseException.document_id == document_id).all()
+    threshold = _SEVERITY_RANK.get(min_severity, 1)
+    all_exceptions = db.query(CaseException).filter(CaseException.document_id == document_id).all()
+    return [e for e in all_exceptions if _SEVERITY_RANK.get(e.severity, 0) >= threshold]
+    all_exceptions = db.query(CaseException).filter(CaseException.document_id == document_id).all()
+    return [e for e in all_exceptions if severity_rank.get(e.severity, 0) >= threshold]
 
 
 @app.post("/exceptions/{exception_id}/resolve", dependencies=[Depends(verify_api_key)], response_model=ExceptionResponse)
