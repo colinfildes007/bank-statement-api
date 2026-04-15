@@ -61,6 +61,11 @@ _DATE_DMY = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b")
 # Monetary amount: 1,234.56 or 0.00
 _AMOUNT = re.compile(r"\b(\d{1,3}(?:,\d{3})*\.\d{2})\b")
 
+# Permissive monetary amount: also matches 4+ digit amounts without a thousands
+# comma (e.g. "2500.00").  Used in _split_block_by_amount_pairs where we need
+# to detect ALL numeric values in a mixed-content block.
+_AMOUNT_FLEX = re.compile(r"\b(\d{1,3}(?:,\d{3})*\.\d{2}|\d{4,}\.\d{2})\b")
+
 _MONTH_SHORT = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
@@ -150,6 +155,80 @@ def _parse_date_short(m: re.Match, year: int) -> Optional[date]:
         return date(year, month, int(m.group(1)))
     except ValueError:
         return None
+
+
+def _split_block_by_amount_pairs(
+    combined: str,
+    txn_date: date,
+    prev_balance: Optional[Decimal],
+    page_num: int,
+) -> Tuple[List[NormalisedTransaction], Optional[Decimal]]:
+    """Split a combined block of text into individual transactions by pairing amounts.
+
+    Strategy: use ``_AMOUNT.split`` to segment the text at every monetary value,
+    yielding alternating non-amount text segments and amount strings.  Consecutive
+    pairs of amounts ``(txn_amount, balance)`` each represent one transaction; the
+    non-amount text that precedes each pair becomes that transaction's description.
+
+    This handles the case where pypdf collapses all rows for a given date onto a
+    single extracted line (or spreads amounts across separate lines), causing the
+    per-line splitter to produce no transactions for the block.
+
+    Returns ``(transactions, updated_prev_balance)``.
+    """
+    # _AMOUNT_FLEX.split on a string with a capturing group returns:
+    # [non-amount, amount, non-amount, amount, ... non-amount]
+    # Using the permissive pattern so that 4-digit-without-comma amounts
+    # (e.g. "2500.00") are also matched and correctly paired with balances.
+    parts = _AMOUNT_FLEX.split(combined)
+    txns: List[NormalisedTransaction] = []
+    desc_parts: List[str] = []
+    pending_amount: Optional[Decimal] = None
+
+    for idx, part in enumerate(parts):
+        if idx % 2 == 0:
+            # Non-amount text segment
+            stripped = part.strip()
+            if stripped:
+                desc_parts.append(stripped)
+        else:
+            # Amount token
+            amount_val = _parse_decimal(part)
+            if amount_val is None:
+                continue
+            if pending_amount is None:
+                pending_amount = amount_val
+            else:
+                # We have a (txn_amount, balance) pair — emit one transaction.
+                txn_amount = pending_amount
+                balance = amount_val
+                desc_text = " ".join(desc_parts) if desc_parts else None
+
+                direction: Optional[str] = None
+                if prev_balance is not None:
+                    delta = balance - prev_balance
+                    if abs(delta - txn_amount) < _BALANCE_TOLERANCE:
+                        direction = "credit"
+                    elif abs(delta + txn_amount) < _BALANCE_TOLERANCE:
+                        direction = "debit"
+                    else:
+                        direction = "credit" if delta >= 0 else "debit"
+
+                txns.append(NormalisedTransaction(
+                    transaction_date=txn_date,
+                    description_raw=desc_text,
+                    description_normalised=desc_text,
+                    direction=direction,
+                    amount=txn_amount,
+                    balance=balance,
+                    extractor_confidence=_TEXT_PARSE_CONFIDENCE,
+                    source_page_number=page_num,
+                ))
+                prev_balance = balance
+                desc_parts = []
+                pending_amount = None
+
+    return txns, prev_balance
 
 
 def _extract_page_texts(file_bytes: bytes) -> List[str]:
@@ -509,12 +588,12 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 i = j if j > i + 1 else i + 1
                 continue
 
-            # --- Fallback: original combined-block behaviour ---
+            # --- Fallback: combined-block behaviour ---
             # Reached when no individual line in the block contained ≥ 2 amounts
-            # (e.g. the transaction amount and balance are on separate lines).
-            desc = _strip_amounts(combined) or None
-
-            # Need at least 2 amounts to build a transaction (txn_amount + balance)
+            # (e.g. pypdf collapsed all rows for this date onto one line, or
+            # amounts and descriptions are on separate lines).
+            # Use _split_block_by_amount_pairs to extract individual transactions
+            # rather than collapsing the entire date group into one record.
             if len(amounts) < 2:
                 if len(amounts) == 1 and prev_balance is None:
                     logger.debug(
@@ -525,6 +604,18 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 i = j if j > i + 1 else i + 1
                 continue
 
+            fallback_txns, prev_balance = _split_block_by_amount_pairs(
+                combined, txn_date, prev_balance, page_num
+            )
+            if fallback_txns:
+                transactions.extend(fallback_txns)
+                i = j if j > i + 1 else i + 1
+                continue
+
+            # Last resort: single transaction from the block (original behaviour).
+            # Reached only when _split_block_by_amount_pairs returns nothing despite
+            # ≥ 2 amounts being present (should not occur in normal operation).
+            desc = _strip_amounts(combined) or None
             balance = amounts[-1]
             txn_amount = amounts[-2]
 

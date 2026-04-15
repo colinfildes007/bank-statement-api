@@ -88,6 +88,26 @@ def startup():
             )
             conn.commit()
 
+        # Widen any varchar(255) transaction columns that can hold long values to TEXT.
+        # This is required when the database was created before these columns were changed
+        # to Text in the ORM model — create_all never alters existing columns.
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE transactions "
+                    "ALTER COLUMN description_raw TYPE TEXT, "
+                    "ALTER COLUMN description_normalised TYPE TEXT, "
+                    "ALTER COLUMN counterparty_name TYPE TEXT, "
+                    "ALTER COLUMN counterparty TYPE TEXT, "
+                    "ALTER COLUMN merchant_name TYPE TEXT"
+                ))
+                conn.commit()
+        except Exception as _migrate_err:
+            logger.warning(
+                "Text-column migration on transactions table failed (may already be TEXT): %s",
+                _migrate_err,
+            )
+
         _seed_default_rules()
 
 
