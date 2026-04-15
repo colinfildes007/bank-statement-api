@@ -546,9 +546,8 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 bamounts = _amounts_in(bline)
                 bdesc = _strip_amounts(bline)
 
-                if len(bamounts) >= 2:
-                    # Complete transaction row: build description from any
-                    # accumulated continuation lines plus this line's text.
+                if len(bamounts) == 2:
+                    # Complete single-transaction row: description + amount + balance.
                     all_parts = pending_desc_parts + ([bdesc] if bdesc else [])
                     desc_text = " ".join(filter(None, all_parts)) or None
 
@@ -577,6 +576,19 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                         source_page_number=page_num,
                     ))
                     prev_balance = bbalance
+                    pending_desc_parts = []
+
+                elif len(bamounts) > 2:
+                    # More than 2 amounts on one line — pypdf has collapsed multiple
+                    # transaction rows onto a single line.  Each transaction carries
+                    # its own (amount, running_balance) pair, so use pair-splitting to
+                    # extract each one individually rather than taking only the last two.
+                    prefix = " ".join(pending_desc_parts)
+                    line_text = (prefix + " " + bline).strip() if prefix else bline
+                    split_txns, prev_balance = _split_block_by_amount_pairs(
+                        line_text, txn_date, prev_balance, page_num
+                    )
+                    txns_from_block.extend(split_txns)
                     pending_desc_parts = []
 
                 else:

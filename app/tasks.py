@@ -701,26 +701,38 @@ def extract_document_task(self, document_id: str, job_id: str):
         logger.info("Sending document %s to Document AI", document_id)
         extraction = process_document(file_bytes, mime_type)
 
-        # Fallback: if Document AI returned no transactions for a PDF, attempt
-        # text-based extraction so Barclays (and similar) column layouts are handled.
-        if not extraction.transactions and mime_type == "application/pdf":
-            logger.warning(
-                "Document AI returned 0 transactions for document %s; "
-                "attempting PDF text fallback parser.",
-                document_id,
-            )
+        # For PDF documents, always also run the text-based fallback parser so that
+        # row-level extraction can be compared against the Document AI result.
+        # Document AI can group multiple same-date transactions into a single entity,
+        # significantly under-counting individual rows.  The text parser iterates the
+        # PDF table by physical row and typically yields a higher, more accurate count.
+        # Whichever extractor returns MORE transactions is used for persistence.
+        if mime_type == "application/pdf":
             from app.pdf_fallback import extract_from_pdf_text
             fallback = extract_from_pdf_text(file_bytes)
-            if fallback.transactions:
+            docai_count = len(extraction.transactions)
+            fallback_count = len(fallback.transactions)
+            logger.info(
+                "Extraction comparison for document %s: Document AI=%d transaction(s), "
+                "text_fallback=%d transaction(s)",
+                document_id, docai_count, fallback_count,
+            )
+            if fallback_count > docai_count:
                 logger.info(
-                    "PDF text fallback extracted %d transaction(s) for document %s",
-                    len(fallback.transactions), document_id,
+                    "Using PDF text fallback for document %s: %d > %d transaction(s)",
+                    document_id, fallback_count, docai_count,
                 )
                 extraction = fallback
-            else:
+            elif docai_count == 0 and fallback_count == 0:
                 logger.warning(
-                    "PDF text fallback also returned 0 transactions for document %s",
+                    "Both Document AI and PDF text fallback returned 0 transactions "
+                    "for document %s",
                     document_id,
+                )
+            else:
+                logger.info(
+                    "Keeping Document AI result for document %s (%d >= %d transaction(s))",
+                    document_id, docai_count, fallback_count,
                 )
 
         # 3. Persist Account
