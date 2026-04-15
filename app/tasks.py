@@ -61,9 +61,13 @@ def _correct_transaction_year(
     """Correct a transaction date whose year is outside the statement period.
 
     Google Document AI occasionally returns a wrong 2-digit year that gets
-    expanded to a future year (e.g. 2027 instead of 2024).  When the
+    expanded to a future year (e.g. 2028 instead of 2024).  When the
     statement period is known, this function replaces the year with the one
     from the statement period that keeps the date within range.
+
+    The check compares the full date (not just the year) against the statement
+    window so that a transaction whose month falls outside the period is still
+    corrected even when the year already matches one of the statement years.
 
     If neither statement date is available the original date is returned
     unchanged.
@@ -79,12 +83,16 @@ def _correct_transaction_year(
     if statement_end_date:
         valid_years.add(statement_end_date.year)
 
-    if txn_date.year in valid_years:
-        return txn_date  # Year is already correct
-
-    # Try to find a year that places the date within the statement period.
+    # Build the full period window for range checks.
     start = statement_start_date or date(min(valid_years), 1, 1)
     end = statement_end_date or date(max(valid_years), 12, 31)
+
+    # If the date already falls within the statement window it is correct.
+    if start <= txn_date <= end:
+        return txn_date
+
+    # Try to find a year from the statement period that places the date
+    # within the window.
     for year in sorted(valid_years):
         try:
             corrected = txn_date.replace(year=year)
@@ -173,6 +181,42 @@ def _extract_counterparty_from_description(description_raw: str) -> "str | None"
     return None
 
 
+# ---------------------------------------------------------------------------
+# Exception type normalisation
+# ---------------------------------------------------------------------------
+
+# Maps internal check/source names to the agreed exception_type enum values.
+# Agreed enum: validation | extraction | categorisation | reconciliation |
+#              risk_flag | review_required | system_error
+_EXCEPTION_TYPE_MAP: dict[str, str] = {
+    # Validation pipeline
+    "validation_failure": "validation",
+    # Extraction pipeline
+    "low_confidence_extraction": "extraction",
+    # Categorisation pipeline
+    "UNCATEGORISED_TRANSACTION": "categorisation",
+    "uncategorised_transaction": "categorisation",
+    # Reconciliation checks
+    "opening_balance_present": "reconciliation",
+    "closing_balance_present": "reconciliation",
+    "amount_parse_consistency": "reconciliation",
+    "running_balance_consistency": "reconciliation",
+    "missing_line_suspicion": "reconciliation",
+    "duplicate_transaction_suspicion": "reconciliation",
+}
+
+
+def _normalise_exception_type(raw_type: str) -> str:
+    """Map an internal exception type string to the agreed enum value.
+
+    Falls back to ``"review_required"`` for any unrecognised value so that
+    callers always receive a value from the agreed enum.
+    """
+    return _EXCEPTION_TYPE_MAP.get(raw_type, "review_required")
+
+
+# ---------------------------------------------------------------------------
+
 def _mark_job_started(db, job_id: str):
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if job:
@@ -227,7 +271,7 @@ def _save_exception(db, document: Document, job_id: str, exception_type: str,
         case_id=document.case_id,
         document_id=document.document_id,
         job_id=job_id,
-        exception_type=exception_type,
+        exception_type=_normalise_exception_type(exception_type),
         severity=severity,
         title=title,
         description=description,
@@ -522,14 +566,35 @@ def _mark_job_completed_with_warnings(db, job_id: str, result: dict):
 
 
 def _persist_reconciliation_exceptions(db, reconciliation_result, case_id: str, document_id: str, job_id: str):
-    """Create CaseException rows for every finding in *reconciliation_result*."""
+    """Create CaseException rows for every finding in *reconciliation_result*.
+
+    Deduplicates against any existing exceptions for the same document so that
+    re-running extraction does not flood the exceptions table with duplicates.
+    The deduplication key is (document_id, normalised exception_type, transaction_id,
+    title) — a tuple that uniquely identifies a specific finding on a specific row.
+    """
     severity_map = {
         "Critical": "Critical",
         "High": "High",
         "Medium": "Medium",
         "Low": "Low",
     }
+
+    # Build a set of existing (exception_type, transaction_id, title) tuples for
+    # this document so we can skip already-persisted findings.
+    existing = db.query(
+        CaseException.exception_type,
+        CaseException.transaction_id,
+        CaseException.title,
+    ).filter(CaseException.document_id == document_id).all()
+    existing_keys = {(e.exception_type, e.transaction_id, e.title) for e in existing}
+
+    added = 0
     for finding in reconciliation_result.findings:
+        mapped_type = _normalise_exception_type(finding.check)
+        key = (mapped_type, finding.transaction_id, finding.title)
+        if key in existing_keys:
+            continue  # Already persisted — skip duplicate
         exception_id = f"exc_{uuid4().hex[:16]}"
         exc = CaseException(
             exception_id=exception_id,
@@ -537,14 +602,18 @@ def _persist_reconciliation_exceptions(db, reconciliation_result, case_id: str, 
             document_id=document_id,
             transaction_id=finding.transaction_id,
             job_id=job_id,
-            exception_type=finding.check,
+            exception_type=mapped_type,
             severity=severity_map.get(finding.severity, "Medium"),
             status="Open",
             title=finding.title,
             description=finding.description,
         )
         db.add(exc)
-    db.commit()
+        existing_keys.add(key)
+        added += 1
+    if added:
+        db.commit()
+
 @celery_app.task(bind=True, name="validate_document_task")
 def validate_document_task(self, document_id: str, job_id: str):
     """Async task to validate a document with real file checks."""
@@ -739,7 +808,7 @@ def extract_document_task(self, document_id: str, job_id: str):
                     document_id=document_id,
                     transaction_id=transaction_id,
                     job_id=job_id,
-                    exception_type="low_confidence_extraction",
+                    exception_type=_normalise_exception_type("low_confidence_extraction"),
                     severity="Medium",
                     status="Open",
                     title="Low-confidence transaction extraction",
@@ -906,7 +975,7 @@ def categorise_document_task(self, document_id: str, job_id: str):
                         document_id=document_id,
                         transaction_id=txn.transaction_id,
                         job_id=job_id,
-                        exception_type="UNCATEGORISED_TRANSACTION",
+                        exception_type=_normalise_exception_type("UNCATEGORISED_TRANSACTION"),
                         severity="Medium" if is_high_value else "Low",
                         status="Open",
                         title=exc_title,
