@@ -92,6 +92,7 @@ def startup():
         # This is required when the database was created before these columns were changed
         # to Text in the ORM model — create_all never alters existing columns.
         try:
+            from sqlalchemy.exc import DatabaseError
             with engine.connect() as conn:
                 conn.execute(text(
                     "ALTER TABLE transactions "
@@ -102,7 +103,7 @@ def startup():
                     "ALTER COLUMN merchant_name TYPE TEXT"
                 ))
                 conn.commit()
-        except Exception as _migrate_err:
+        except DatabaseError as _migrate_err:
             logger.warning(
                 "Text-column migration on transactions table failed (may already be TEXT): %s",
                 _migrate_err,

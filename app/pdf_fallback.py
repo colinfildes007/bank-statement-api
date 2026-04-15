@@ -165,10 +165,11 @@ def _split_block_by_amount_pairs(
 ) -> Tuple[List[NormalisedTransaction], Optional[Decimal]]:
     """Split a combined block of text into individual transactions by pairing amounts.
 
-    Strategy: use ``_AMOUNT.split`` to segment the text at every monetary value,
-    yielding alternating non-amount text segments and amount strings.  Consecutive
-    pairs of amounts ``(txn_amount, balance)`` each represent one transaction; the
-    non-amount text that precedes each pair becomes that transaction's description.
+    Strategy: use ``_AMOUNT_FLEX.split`` to segment the text at every monetary
+    value, yielding alternating non-amount text segments and amount strings.
+    Consecutive pairs of amounts ``(txn_amount, balance)`` each represent one
+    transaction; the non-amount text that precedes each pair becomes that
+    transaction's description.
 
     This handles the case where pypdf collapses all rows for a given date onto a
     single extracted line (or spreads amounts across separate lines), causing the
