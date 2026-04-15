@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -48,6 +48,59 @@ DATE_PATTERN = re.compile(
     r"\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4})\b",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Date year correction helper
+# ---------------------------------------------------------------------------
+
+def _correct_transaction_year(
+    txn_date: "date | None",
+    statement_start_date: "date | None",
+    statement_end_date: "date | None",
+) -> "date | None":
+    """Correct a transaction date whose year is outside the statement period.
+
+    Google Document AI occasionally returns a wrong 2-digit year that gets
+    expanded to a future year (e.g. 2027 instead of 2024).  When the
+    statement period is known, this function replaces the year with the one
+    from the statement period that keeps the date within range.
+
+    If neither statement date is available the original date is returned
+    unchanged.
+    """
+    if txn_date is None:
+        return txn_date
+    if statement_start_date is None and statement_end_date is None:
+        return txn_date
+
+    valid_years: set[int] = set()
+    if statement_start_date:
+        valid_years.add(statement_start_date.year)
+    if statement_end_date:
+        valid_years.add(statement_end_date.year)
+
+    if txn_date.year in valid_years:
+        return txn_date  # Year is already correct
+
+    # Try to find a year that places the date within the statement period.
+    start = statement_start_date or date(min(valid_years), 1, 1)
+    end = statement_end_date or date(max(valid_years), 12, 31)
+    for year in sorted(valid_years):
+        try:
+            corrected = txn_date.replace(year=year)
+            if start <= corrected <= end:
+                return corrected
+        except ValueError:
+            continue  # e.g. 29 Feb in a non-leap year
+
+    # No candidate year falls within the period; substitute with the
+    # reference year (end_date preferred, else start_date).
+    ref_year = (statement_end_date or statement_start_date).year
+    try:
+        return txn_date.replace(year=ref_year)
+    except ValueError:
+        return txn_date
+
 
 # ---------------------------------------------------------------------------
 # Transaction-type classification helpers
@@ -632,13 +685,27 @@ def extract_document_task(self, document_id: str, job_id: str):
                 txn_data.description_raw
             )
 
+            # Correct transaction year against the statement period.  Document AI
+            # occasionally returns wrong 2-digit years (e.g. 27 → 2027 instead of
+            # 2024) that must be reconciled against the known statement window.
+            corrected_date = _correct_transaction_year(
+                txn_data.transaction_date,
+                acct_data.statement_start_date,
+                acct_data.statement_end_date,
+            )
+            corrected_posting = _correct_transaction_year(
+                txn_data.posting_date,
+                acct_data.statement_start_date,
+                acct_data.statement_end_date,
+            )
+
             txn = Transaction(
                 transaction_id=transaction_id,
                 case_id=document.case_id,
                 document_id=document_id,
                 account_id=account_id,
-                transaction_date=txn_data.transaction_date,
-                posting_date=txn_data.posting_date,
+                transaction_date=corrected_date,
+                posting_date=corrected_posting,
                 description_raw=txn_data.description_raw,
                 description_normalised=txn_data.description_normalised,
                 direction=txn_data.direction,
@@ -657,7 +724,7 @@ def extract_document_task(self, document_id: str, job_id: str):
             _amount = float(txn_data.amount) if txn_data.amount is not None else None
             txn_list.append({
                 "transaction_id": transaction_id,
-                "date": txn_data.transaction_date.isoformat() if txn_data.transaction_date else None,
+                "date": corrected_date.isoformat() if corrected_date else None,
                 "description": txn_data.description_raw,
                 "debit": _amount if txn_data.direction == "debit" else None,
                 "credit": _amount if txn_data.direction == "credit" else None,
@@ -812,26 +879,44 @@ def categorise_document_task(self, document_id: str, job_id: str):
                 txn.needs_review = True
                 uncategorised_count += 1
 
-                exception_id = f"exc_{uuid4().hex[:8]}"
-                description_text = txn.description_raw or txn.description_normalised or "(no description)"
-                date_text = str(txn.transaction_date) if txn.transaction_date else "unknown date"
-                exc = CaseException(
-                    exception_id=exception_id,
-                    case_id=document.case_id,
-                    document_id=document_id,
-                    transaction_id=txn.transaction_id,
-                    job_id=job_id,
-                    exception_type="UNCATEGORISED_TRANSACTION",
-                    severity="Low",
-                    status="Open",
-                    title="Transaction could not be categorised",
-                    description=(
-                        f"Transaction '{description_text}' on {date_text} "
-                        f"did not match any categorisation rule."
-                    ),
-                )
-                db.add(exc)
-                exceptions_created += 1
+                # Only raise a CaseException for genuinely high-risk uncategorised
+                # transactions (e.g. high-value debits with no description).
+                # Creating one exception per transaction floods the queue and makes
+                # it unusable when the categorisation engine has low coverage.
+                # £500 threshold follows common affordability-review practice for
+                # flagging material unexplained debits.  Adjust via the rule engine
+                # for tighter or looser thresholds per deployment.
+                _EXCEPTION_AMOUNT_THRESHOLD = Decimal("500")
+                txn_amount = txn.amount or Decimal("0")
+                is_high_value = txn_amount >= _EXCEPTION_AMOUNT_THRESHOLD
+                is_missing_description = not (txn.description_raw or txn.description_normalised)
+                if is_high_value or is_missing_description:
+                    exception_id = f"exc_{uuid4().hex[:8]}"
+                    description_text = txn.description_raw or txn.description_normalised or "(no description)"
+                    date_text = str(txn.transaction_date) if txn.transaction_date else "unknown date"
+                    if is_high_value and not is_missing_description:
+                        exc_title = "High-value transaction could not be categorised"
+                    elif is_missing_description and not is_high_value:
+                        exc_title = "Transaction with no description could not be categorised"
+                    else:
+                        exc_title = "High-value transaction with no description could not be categorised"
+                    exc = CaseException(
+                        exception_id=exception_id,
+                        case_id=document.case_id,
+                        document_id=document_id,
+                        transaction_id=txn.transaction_id,
+                        job_id=job_id,
+                        exception_type="UNCATEGORISED_TRANSACTION",
+                        severity="Medium" if is_high_value else "Low",
+                        status="Open",
+                        title=exc_title,
+                        description=(
+                            f"Transaction '{description_text}' on {date_text} "
+                            f"(amount: £{txn_amount:.2f}) did not match any categorisation rule."
+                        ),
+                    )
+                    db.add(exc)
+                    exceptions_created += 1
             else:
                 txn.needs_review = False
                 categorised_count += 1
