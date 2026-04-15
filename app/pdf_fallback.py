@@ -77,9 +77,11 @@ _KNOWN_BANKS = [
 # reconciliation flags them for manual review.
 _TEXT_PARSE_CONFIDENCE = Decimal("0.75")
 
-# Maximum number of lines to collect after a date-headed line when building
-# a single transaction block (description + amounts may span several lines).
-_MAX_LOOKAHEAD_LINES = 6
+# Safety cap on the number of continuation lines collected for a single date
+# group.  Must be large enough to accommodate all transactions that share a
+# date (Barclays statements can have 20+ transactions per day); the loop
+# stops earlier at the next date line or balance marker in practice.
+_MAX_LOOKAHEAD_LINES = 200
 
 # Tolerance (in currency units) when checking whether a balance delta exactly
 # matches a transaction amount.  2p covers minor PDF rounding artefacts.
@@ -198,21 +200,34 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
     if m:
         account.account_holder_name = m.group(0).strip()
 
-    # Statement period: "1 January 2024 to 31 January 2024"
-    # Also handles abbreviated month names (e.g. "Jan") and 2-digit years (e.g. "20" → 2020)
-    # as seen in Barclays PDF headers.
+    # Statement period extraction.  Tries three increasingly permissive patterns:
+    #
+    #   Pattern A – both dates carry their own year, separated by "to", ASCII
+    #     hyphen-minus (-), or en-dash (–, U+2013):
+    #     "1 January 2024 to 31 January 2024"
+    #     "19 Feb 20 to 18 May 20"   (2-digit years)
+    #
+    #   Pattern B – shared trailing year, dates joined by ASCII hyphen-minus or
+    #     en-dash (U+2013), without the word "to" in between:
+    #     "19 Feb – 18 May 2020"     (Barclays single-page header style)
+    #     "19 Feb - 18 May 20"
+    #
+    #   Pattern C – individual start / end date labels (e.g. "Statement date" +
+    #     "Statement period", or two separate date lines).
+    #
+    # Group numbering for pattern A:  (1)day1 (2)mon1 (3)yr1 … (4)day2 (5)mon2 (6)yr2
+    # Group numbering for pattern B:  (1)day1 (2)mon1 (3)day2 (4)mon2 (5)yr_shared
+
+    _MON = (
+        r"(January|February|March|April|May|June|July|August|"
+        r"September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    )
+
     m = re.search(
-        r"(\d{1,2})\s+"
-        r"(January|February|March|April|May|June|July|August|"
-        r"September|October|November|December|"
-        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-        r"\s+(\d{2,4})"
-        r"\s+to\s+"
-        r"(\d{1,2})\s+"
-        r"(January|February|March|April|May|June|July|August|"
-        r"September|October|November|December|"
-        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-        r"\s+(\d{2,4})",
+        r"(\d{1,2})\s+" + _MON + r"\s+(\d{2,4})"
+        r"(?:\s+to\s+|\s*[\-\u2013]\s*)"
+        r"(\d{1,2})\s+" + _MON + r"\s+(\d{2,4})",
         full_text, re.I,
     )
     if m:
@@ -225,6 +240,26 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
                 account.statement_end_date = date(_expand_year(int(m.group(6))), em, int(m.group(4)))
         except ValueError:
             pass
+
+    # Pattern B: "19 Feb – 18 May 2020" — first date has no year; shared year trails.
+    if account.statement_start_date is None or account.statement_end_date is None:
+        m2 = re.search(
+            r"(\d{1,2})\s+" + _MON
+            + r"\s*[\-\u2013]\s*"
+            + r"(\d{1,2})\s+" + _MON + r"\s+(\d{2,4})",
+            full_text, re.I,
+        )
+        if m2:
+            sm = _MONTH_SHORT.get(m2.group(2)[:3].lower())
+            em = _MONTH_SHORT.get(m2.group(4)[:3].lower())
+            shared_year = _expand_year(int(m2.group(5)))
+            try:
+                if sm and account.statement_start_date is None:
+                    account.statement_start_date = date(shared_year, sm, int(m2.group(1)))
+                if em and account.statement_end_date is None:
+                    account.statement_end_date = date(shared_year, em, int(m2.group(3)))
+            except ValueError:
+                pass
 
     # Explicit opening / closing balance labels.
     # Try Barclays-specific wording first ("Balance Brought/Carried Forward"),
@@ -355,10 +390,12 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             # Rest of the date line (description + possible amounts)
             rest = line[dm.end():].strip()
 
-            # Collect lookahead lines until the next date-headed line or a
+            # Collect all continuation lines until the next date-headed line or a
             # balance-marker line (e.g. "Balance Carried Forward …").  Stopping
             # at balance markers prevents their monetary amounts from being
             # mistaken for part of the preceding transaction.
+            # Note: _MAX_LOOKAHEAD_LINES is a generous safety cap; in practice
+            # the loop terminates early at the next date or balance-marker line.
             lookahead: List[str] = []
             j = i + 1
             while j < min(i + _MAX_LOOKAHEAD_LINES, len(lines)):
@@ -374,9 +411,9 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 lookahead.append(nxt)
                 j += 1
 
+            # Pre-compute combined text (used by special-row checks and fallback).
             combined = " ".join(filter(None, [rest] + lookahead))
             amounts = _amounts_in(combined)
-            desc = _strip_amounts(combined) or None
 
             # "Opening balance" / "Balance Brought Forward" row — treat as
             # account-level metadata, not a transaction.  Check only the
@@ -397,6 +434,85 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 prev_balance = amounts[-1] if amounts else prev_balance
                 i = j if j > i + 1 else i + 1
                 continue
+
+            # ---------------------------------------------------------------
+            # Per-line transaction splitting.
+            #
+            # Barclays (and similar) PDFs can have several transactions sharing
+            # the same date.  The PDF text extractor outputs one line per
+            # transaction row, but only the *first* row for a given date starts
+            # with the "DD Mon" token — continuation rows have no leading date.
+            # The old code combined every continuation line into a single block
+            # and extracted only the *last* pair of amounts, which produced one
+            # transaction per date instead of one per line item.
+            #
+            # The new approach processes each line in the date-group block
+            # independently:
+            #   • A line that contains ≥ 2 monetary amounts is a complete
+            #     transaction row (description text + amount + running balance).
+            #   • A line with < 2 amounts is treated as a description
+            #     continuation and accumulated for the next transaction row.
+            #
+            # If no per-line transactions are detected (e.g. amounts happen to
+            # span multiple lines) we fall back to the original combined-block
+            # behaviour so that edge-case PDFs are still handled.
+            # ---------------------------------------------------------------
+
+            all_block_lines = ([rest] if rest else []) + lookahead
+            pending_desc_parts: List[str] = []
+            txns_from_block: List[NormalisedTransaction] = []
+
+            for bline in all_block_lines:
+                bamounts = _amounts_in(bline)
+                bdesc = _strip_amounts(bline)
+
+                if len(bamounts) >= 2:
+                    # Complete transaction row: build description from any
+                    # accumulated continuation lines plus this line's text.
+                    all_parts = pending_desc_parts + ([bdesc] if bdesc else [])
+                    desc_text = " ".join(filter(None, all_parts)) or None
+
+                    bbalance = bamounts[-1]
+                    btxn_amount = bamounts[-2]
+
+                    # Infer direction from balance movement.
+                    bdir: Optional[str] = None
+                    if prev_balance is not None:
+                        bdelta = bbalance - prev_balance
+                        if abs(bdelta - btxn_amount) < _BALANCE_TOLERANCE:
+                            bdir = "credit"
+                        elif abs(bdelta + btxn_amount) < _BALANCE_TOLERANCE:
+                            bdir = "debit"
+                        else:
+                            bdir = "credit" if bdelta >= 0 else "debit"
+
+                    txns_from_block.append(NormalisedTransaction(
+                        transaction_date=txn_date,
+                        description_raw=desc_text,
+                        description_normalised=desc_text,
+                        direction=bdir,
+                        amount=btxn_amount,
+                        balance=bbalance,
+                        extractor_confidence=_TEXT_PARSE_CONFIDENCE,
+                        source_page_number=page_num,
+                    ))
+                    prev_balance = bbalance
+                    pending_desc_parts = []
+
+                else:
+                    # Description continuation — accumulate for the next row.
+                    if bdesc:
+                        pending_desc_parts.append(bdesc)
+
+            if txns_from_block:
+                transactions.extend(txns_from_block)
+                i = j if j > i + 1 else i + 1
+                continue
+
+            # --- Fallback: original combined-block behaviour ---
+            # Reached when no individual line in the block contained ≥ 2 amounts
+            # (e.g. the transaction amount and balance are on separate lines).
+            desc = _strip_amounts(combined) or None
 
             # Need at least 2 amounts to build a transaction (txn_amount + balance)
             if len(amounts) < 2:
