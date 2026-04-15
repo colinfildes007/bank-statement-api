@@ -131,7 +131,8 @@ def _parse_date_long_short_year(m: re.Match) -> Optional[date]:
         return None
 
 
-
+def _parse_date_dmy(m: re.Match) -> Optional[date]:
+    """Parse a DD/MM/YYYY match."""
     try:
         return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
     except ValueError:

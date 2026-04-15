@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import verify_api_key
-from app.database import Base, engine, get_db
+from app.database import Base, SessionLocal, engine, get_db
 from app.models import (
     Account, AiReport, Case, CaseException, CounterpartyRule, Document,
     KeywordRule, ManualOverride, MerchantAlias, MerchantRule, ProcessingJob,
@@ -83,6 +83,78 @@ def startup():
                 text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_secondary VARCHAR(100)")
             )
             conn.commit()
+
+        _seed_default_rules()
+
+
+# Default categorisation keyword rules for common UK bank transaction prefixes.
+# These are seeded once at startup only when the keyword_rules table is empty,
+# so they will not overwrite rules created by users via the API.
+_DEFAULT_KEYWORD_RULES = [
+    # Income
+    {"keyword": "BGC",     "category": "income",           "match_type": "startswith", "priority": 10},
+    {"keyword": "BACS",    "category": "income",           "match_type": "startswith", "priority": 11},
+    {"keyword": "SALARY",  "category": "income",           "match_type": "contains",   "priority": 12},
+    {"keyword": "WAGES",   "category": "income",           "match_type": "contains",   "priority": 13},
+    {"keyword": "PAYROLL", "category": "income",           "match_type": "contains",   "priority": 14},
+    {"keyword": "CDT",     "category": "income",           "match_type": "startswith", "priority": 15},
+    # Household bills
+    {"keyword": "DD",      "category": "household_bills",  "match_type": "startswith", "priority": 20},
+    {"keyword": "SO",      "category": "household_bills",  "match_type": "startswith", "priority": 21},
+    {"keyword": "BP",      "category": "household_bills",  "match_type": "startswith", "priority": 22},
+    # Everyday spending
+    {"keyword": "VIS",     "category": "everyday_spending","match_type": "startswith", "priority": 30},
+    {"keyword": "VISA",    "category": "everyday_spending","match_type": "startswith", "priority": 31},
+    {"keyword": "POS",     "category": "everyday_spending","match_type": "startswith", "priority": 32},
+    {"keyword": "DEB",     "category": "everyday_spending","match_type": "startswith", "priority": 33},
+    # Transport
+    {"keyword": "TFL",       "category": "transport",      "match_type": "contains",   "priority": 40},
+    {"keyword": "TRAINLINE", "category": "transport",      "match_type": "contains",   "priority": 41},
+    {"keyword": "UBER",      "category": "transport",      "match_type": "contains",   "priority": 42},
+    # Financial / banking
+    {"keyword": "ATM",      "category": "financial_banking","match_type": "startswith", "priority": 50},
+    {"keyword": "CHQ",      "category": "financial_banking","match_type": "startswith", "priority": 51},
+    {"keyword": "CHEQUE",   "category": "financial_banking","match_type": "startswith", "priority": 52},
+    {"keyword": "TFR",      "category": "financial_banking","match_type": "startswith", "priority": 53},
+    {"keyword": "TRANSFER", "category": "financial_banking","match_type": "startswith", "priority": 54},
+    {"keyword": "FPS",      "category": "financial_banking","match_type": "startswith", "priority": 55},
+    {"keyword": "INT",      "category": "financial_banking","match_type": "startswith", "priority": 56},
+    {"keyword": "REF",      "category": "financial_banking","match_type": "startswith", "priority": 57},
+    {"keyword": "REFUND",   "category": "financial_banking","match_type": "startswith", "priority": 58},
+]
+
+
+def _seed_default_rules():
+    """Seed default UK bank keyword rules if the table is empty.
+
+    Safe to call on every startup — it checks for existing rows first and
+    does nothing when rules have already been created (either by a previous
+    seed or by users via the API).
+    """
+    if SessionLocal is None:
+        logger.warning("_seed_default_rules: SessionLocal is None — database not configured, skipping rule seeding")
+        return
+    db = SessionLocal()
+    try:
+        if db.query(KeywordRule).first():
+            return  # Rules already exist — do not overwrite
+        for r in _DEFAULT_KEYWORD_RULES:
+            db.add(KeywordRule(
+                rule_id=f"rule_{uuid4().hex[:8]}",
+                keyword=r["keyword"],
+                category=r["category"],
+                match_type=r["match_type"],
+                case_sensitive=False,
+                priority=r["priority"],
+                enabled=True,
+            ))
+        db.commit()
+        logger.info("Seeded %d default keyword categorisation rules", len(_DEFAULT_KEYWORD_RULES))
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to seed default keyword rules")
+    finally:
+        db.close()
 
 
 @app.get("/")

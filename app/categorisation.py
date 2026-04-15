@@ -121,7 +121,12 @@ def apply_rules(db: Session, transaction: Transaction, aliases: Optional[list] =
         .all()
     )
     for rule in counterparty_rules:
-        if _text_matches(transaction.counterparty, rule.counterparty, rule.match_type, rule.case_sensitive):
+        if _text_matches(
+            transaction.counterparty_name or transaction.counterparty,
+            rule.counterparty,
+            rule.match_type,
+            rule.case_sensitive,
+        ):
             return rule.category, "counterparty", rule.rule_id
 
     # 4. Keyword rules — match against description or reference
