@@ -66,6 +66,14 @@ _AMOUNT = re.compile(r"\b(\d{1,3}(?:,\d{3})*\.\d{2})\b")
 # to detect ALL numeric values in a mixed-content block.
 _AMOUNT_FLEX = re.compile(r"\b(\d{1,3}(?:,\d{3})*\.\d{2}|\d{4,}\.\d{2})\b")
 
+# Some UK banks (including Barclays) print overdraft balances with an OD, DR,
+# or CR suffix directly attached to the amount — e.g. "975.00OD" or "50.00DR".
+# The word-boundary anchor in _AMOUNT_FLEX prevents matching in these cases
+# because "0" (word char) is followed immediately by "O"/"D"/"C" (also word
+# chars), so there is no boundary.  This pattern normalises the text before
+# amount detection by inserting a space: "975.00OD" → "975.00 OD".
+_OD_DR_SUFFIX = re.compile(r"(\d{2})(OD|DR|CR)\b", re.IGNORECASE)
+
 _MONTH_SHORT = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
@@ -243,6 +251,9 @@ def _extract_page_texts(file_bytes: bytes) -> List[str]:
 
 
 def _amounts_in(text: str) -> List[Decimal]:
+    # Normalise OD/DR/CR suffixes directly attached to amounts before scanning,
+    # so that e.g. "975.00OD" is treated as "975.00" for amount detection.
+    text = _OD_DR_SUFFIX.sub(r"\1 \2", text)
     # Use the permissive pattern so that 4-digit amounts without a thousands
     # comma (e.g. "1500.00", "2214.70") are detected alongside standard
     # comma-formatted amounts.  pypdf sometimes strips comma separators from
@@ -255,9 +266,22 @@ def _amounts_in(text: str) -> List[Decimal]:
 
 
 def _strip_amounts(text: str) -> str:
+    # Normalise OD/DR/CR suffixes so the same amounts removed by _amounts_in
+    # are also removed here (keeps descriptions consistent).
+    text = _OD_DR_SUFFIX.sub(r"\1 \2", text)
     # Use the same permissive pattern as _amounts_in so that 4-digit unformatted
     # amounts are also removed from descriptions.
-    return re.sub(r"\s+", " ", _AMOUNT_FLEX.sub("", text)).strip()
+    text = _AMOUNT_FLEX.sub("", text)
+    # Collapse internal whitespace first so the trailing-strip below can match
+    # cleanly (without stray spaces between the amount position and EOL).
+    text = re.sub(r"\s+", " ", text).strip()
+    # Strip any trailing OD/DR/CR overdraft/direction indicators that were
+    # attached to the last amount on the line (e.g. "975.00OD" becomes
+    # "975.00 OD" after normalisation; once the amount is removed, " OD"
+    # is left as a trailing artefact).  We only remove *trailing* tokens to
+    # avoid accidentally clipping "DR JOHN SMITH" style payee titles.
+    text = re.sub(r"(?:\s+(?:OD|DR|CR))+$", "", text, flags=re.IGNORECASE).strip()
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +468,15 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
     # the date prefix is absent on the new page) to the correct date.
     last_txn_date: Optional[date] = None
 
+    # When a date block ends with a single unresolved amount (e.g. the
+    # transaction amount is on the last line of a page but the running balance
+    # is on the first line of the next page), we carry the pending amount and
+    # its description across the page boundary so they can be paired with the
+    # lone balance line at the top of the next page.
+    pending_lone_amount: Optional[Decimal] = None
+    pending_lone_desc: Optional[str] = None
+    pending_lone_date: Optional[date] = None
+
     for page_num, page_text in enumerate(pages, start=1):
         lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
         i = 0
@@ -492,13 +525,44 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                     bal_amounts = _amounts_in(line)
                     if bal_amounts:
                         prev_balance = bal_amounts[-1]
+                    # A balance marker clears any pending cross-page lone amount.
+                    pending_lone_amount = None
+                    pending_lone_desc = None
+                    pending_lone_date = None
                 elif last_txn_date is not None:
                     # No date on this line — could be a continuation transaction
                     # from the previous date group that overflowed a page break.
-                    # If the line carries monetary values treat it as a dateless
-                    # transaction row for the most recently seen date.
                     line_amounts = _amounts_in(line)
-                    if len(line_amounts) >= 2:
+                    if pending_lone_amount is not None and len(line_amounts) == 1:
+                        # Pair the pending lone amount (transaction amount from the
+                        # end of the previous page) with this lone balance amount.
+                        balance = line_amounts[0]
+                        bdir: Optional[str] = None
+                        if prev_balance is not None:
+                            bdelta = balance - prev_balance
+                            if abs(bdelta - pending_lone_amount) < _BALANCE_TOLERANCE:
+                                bdir = "credit"
+                            elif abs(bdelta + pending_lone_amount) < _BALANCE_TOLERANCE:
+                                bdir = "debit"
+                            else:
+                                bdir = "credit" if bdelta >= 0 else "debit"
+                        transactions.append(NormalisedTransaction(
+                            transaction_date=pending_lone_date,
+                            description_raw=pending_lone_desc,
+                            description_normalised=pending_lone_desc,
+                            direction=bdir,
+                            amount=pending_lone_amount,
+                            balance=balance,
+                            extractor_confidence=_TEXT_PARSE_CONFIDENCE,
+                            source_page_number=page_num,
+                        ))
+                        prev_balance = balance
+                        pending_lone_amount = None
+                        pending_lone_desc = None
+                        pending_lone_date = None
+                    elif len(line_amounts) >= 2:
+                        # If the line carries monetary values treat it as a
+                        # dateless transaction row for the most recently seen date.
                         cont_txns, prev_balance = _split_block_by_amount_pairs(
                             line, last_txn_date, prev_balance, page_num
                         )
@@ -614,6 +678,13 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             amounts = _amounts_in(combined)
             pending_desc_parts: List[str] = []
             txns_from_block: List[NormalisedTransaction] = []
+            # Track lines that contain exactly 1 amount (neither a complete
+            # transaction row nor a pure description).  These may represent a
+            # transaction split across two lines (description+amount on one
+            # line, balance on the next) that cannot be resolved by the normal
+            # 2-amount per-line path.  We recover them after the main per-line
+            # loop by combining their text and running pair-splitting.
+            unconsumed_1_amt_lines: List[str] = []
 
             for bline in all_block_lines:
                 bamounts = _amounts_in(bline)
@@ -665,13 +736,53 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                     pending_desc_parts = []
 
                 else:
-                    # Description continuation — accumulate for the next row.
-                    if bdesc:
-                        pending_desc_parts.append(bdesc)
+                    # 0 or 1 amounts — could be a description continuation or a
+                    # transaction row split across two lines.
+                    if len(bamounts) == 1:
+                        # Keep the original line (with its amount) so we can
+                        # attempt recovery via pair-splitting after the main loop.
+                        # Do NOT add to pending_desc_parts here: if a subsequent
+                        # 2-amount line consumes pending_desc_parts as its
+                        # description prefix, the 1-amount line's description
+                        # would be incorrectly prepended to the wrong transaction.
+                        # Recovery via pair-splitting will pick up the description
+                        # from the combined unconsumed text.
+                        unconsumed_1_amt_lines.append(bline)
+                    else:
+                        # Pure description line (0 amounts) — accumulate for the
+                        # next 2-amount transaction row.
+                        if bdesc:
+                            pending_desc_parts.append(bdesc)
+
+            # Recovery pass: if some lines had exactly 1 amount each (which the
+            # main loop could not pair into complete transactions), try to extract
+            # transactions from their combined text via pair-splitting.  This
+            # handles the common pypdf layout where a transaction's amount and
+            # running balance land on separate lines — e.g.:
+            #   "FPS SALARY 2500.00"  ← Money In column
+            #   "3475.00"             ← Balance column (separate line)
+            if unconsumed_1_amt_lines:
+                u_combined = " ".join(unconsumed_1_amt_lines)
+                u_amounts = _amounts_in(u_combined)
+                if len(u_amounts) >= 2:
+                    # Use prev_balance as it stands after any resolved per-line
+                    # transactions; direction inference may be approximate when
+                    # the recovered transactions interleave with the per-line ones,
+                    # but the count and amounts will be correct.
+                    extra_txns, prev_balance = _split_block_by_amount_pairs(
+                        u_combined, txn_date, prev_balance, page_num
+                    )
+                    txns_from_block.extend(extra_txns)
 
             if txns_from_block:
                 transactions.extend(txns_from_block)
                 last_txn_date = txn_date
+                # Clear any stale pending lone amount — we successfully parsed
+                # this date group so the previous cross-page state is no longer
+                # relevant.
+                pending_lone_amount = None
+                pending_lone_desc = None
+                pending_lone_date = None
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -688,11 +799,18 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                         amounts[0], txn_date,
                     )
                     prev_balance = amounts[0]
-                elif amounts:
+                elif len(amounts) == 1:
+                    # Single unresolved amount — may be the transaction amount of a
+                    # row whose balance overflowed onto the next page.  Carry it
+                    # forward so the dateless-continuation handler can pair it with
+                    # the lone balance line at the top of the next page.
+                    pending_lone_amount = amounts[0]
+                    pending_lone_desc = _strip_amounts(combined) or None
+                    pending_lone_date = txn_date
                     logger.debug(
-                        "pdf_fallback: date block on page %d (%s) has only %d amount(s) — "
-                        "insufficient for a transaction row, skipped",
-                        page_num, txn_date, len(amounts),
+                        "pdf_fallback: date block on page %d (%s) has 1 amount (%.2f) — "
+                        "carrying forward as pending cross-page transaction",
+                        page_num, txn_date, float(amounts[0]),
                     )
                 last_txn_date = txn_date
                 i = j if j > i + 1 else i + 1
