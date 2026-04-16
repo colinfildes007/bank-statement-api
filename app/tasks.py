@@ -197,7 +197,6 @@ _EXCEPTION_TYPE_MAP: dict[str, str] = {
     # Extraction pipeline
     "low_confidence_extraction": "extraction",
     "incomplete_extraction": "extraction",
-    "money_totals_mismatch": "extraction",
     # Categorisation pipeline
     "UNCATEGORISED_TRANSACTION": "categorisation",
     "uncategorised_transaction": "categorisation",
@@ -210,7 +209,6 @@ _EXCEPTION_TYPE_MAP: dict[str, str] = {
     "duplicate_transaction_suspicion": "reconciliation",
     "transaction_count_plausibility": "reconciliation",
     "money_totals_mismatch": "reconciliation",
-    "incomplete_extraction": "extraction",
 }
 
 

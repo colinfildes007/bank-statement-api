@@ -518,7 +518,7 @@ def check_incomplete_extraction(extracted_data: dict) -> list:
         _AVG_TXN_VALUE = Decimal("50")
         if total_flow > 0:
             estimated = int(total_flow / _AVG_TXN_VALUE)
-            if estimated > 0 and count < estimated // 2:
+            if estimated > 0 and count < estimated // 2:  # fewer than ~50% of estimate
                 findings.append(ReconciliationFinding(
                     check="incomplete_extraction",
                     severity="High",

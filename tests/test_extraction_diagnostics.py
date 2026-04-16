@@ -220,7 +220,7 @@ class TestMoneyTotalsMismatch:
 
 class TestIncompleteExtraction:
     def test_critical_below_25_percent(self):
-        """74 of 195 expected = 38% — but below 25% threshold should be Critical."""
+        """47 of 195 expected = 24% — below 25% threshold should be Critical."""
         txns = [_txn(f"2020-03-{i % 28 + 1:02d}", f"TXN {i}", debit=10.0) for i in range(47)]
         data = {"transactions": txns, "expected_transaction_count": 195}
         findings = check_incomplete_extraction(data)
