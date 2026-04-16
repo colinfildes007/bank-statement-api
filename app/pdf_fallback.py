@@ -741,9 +741,18 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                     if len(bamounts) == 1:
                         # Keep the original line (with its amount) so we can
                         # attempt recovery via pair-splitting after the main loop.
+                        # Do NOT add to pending_desc_parts here: if a subsequent
+                        # 2-amount line consumes pending_desc_parts as its
+                        # description prefix, the 1-amount line's description
+                        # would be incorrectly prepended to the wrong transaction.
+                        # Recovery via pair-splitting will pick up the description
+                        # from the combined unconsumed text.
                         unconsumed_1_amt_lines.append(bline)
-                    if bdesc:
-                        pending_desc_parts.append(bdesc)
+                    else:
+                        # Pure description line (0 amounts) — accumulate for the
+                        # next 2-amount transaction row.
+                        if bdesc:
+                            pending_desc_parts.append(bdesc)
 
             # Recovery pass: if some lines had exactly 1 amount each (which the
             # main loop could not pair into complete transactions), try to extract
@@ -754,7 +763,8 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             #   "3475.00"             ← Balance column (separate line)
             if unconsumed_1_amt_lines:
                 u_combined = " ".join(unconsumed_1_amt_lines)
-                if len(_amounts_in(u_combined)) >= 2:
+                u_amounts = _amounts_in(u_combined)
+                if len(u_amounts) >= 2:
                     # Use prev_balance as it stands after any resolved per-line
                     # transactions; direction inference may be approximate when
                     # the recovered transactions interleave with the per-line ones,
