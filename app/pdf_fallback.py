@@ -243,14 +243,21 @@ def _extract_page_texts(file_bytes: bytes) -> List[str]:
 
 
 def _amounts_in(text: str) -> List[Decimal]:
+    # Use the permissive pattern so that 4-digit amounts without a thousands
+    # comma (e.g. "1500.00", "2214.70") are detected alongside standard
+    # comma-formatted amounts.  pypdf sometimes strips comma separators from
+    # financial figures, causing the stricter _AMOUNT pattern to miss them and
+    # resulting in transaction lines appearing to have fewer than 2 amounts.
     return [
-        v for v in (_parse_decimal(m.group(1)) for m in _AMOUNT.finditer(text))
+        v for v in (_parse_decimal(m.group(1)) for m in _AMOUNT_FLEX.finditer(text))
         if v is not None
     ]
 
 
 def _strip_amounts(text: str) -> str:
-    return re.sub(r"\s+", " ", _AMOUNT.sub("", text)).strip()
+    # Use the same permissive pattern as _amounts_in so that 4-digit unformatted
+    # amounts are also removed from descriptions.
+    return re.sub(r"\s+", " ", _AMOUNT_FLEX.sub("", text)).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +439,11 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
         else None
     )
 
+    # Most recent date successfully assigned to a transaction block.  Used to
+    # attribute dateless continuation lines (e.g. page-break overflows where
+    # the date prefix is absent on the new page) to the correct date.
+    last_txn_date: Optional[date] = None
+
     for page_num, page_text in enumerate(pages, start=1):
         lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
         i = 0
@@ -466,6 +478,31 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 dm = dm_short
 
             if txn_date is None or dm is None:
+                # Line has no date prefix — check for dateless continuation
+                # transactions that overflowed a page break.
+                is_balance_marker = re.search(
+                    r"\b(?:opening|closing)\s+balance\b"
+                    r"|\bbalance\s+(?:brought|carried)\s+forward\b",
+                    line, re.I,
+                )
+                if is_balance_marker:
+                    # Update prev_balance from page-level balance-marker lines
+                    # that lack a date prefix (e.g. "Balance Brought Forward
+                    # 331.68" at the top of a continuation page).
+                    bal_amounts = _amounts_in(line)
+                    if bal_amounts:
+                        prev_balance = bal_amounts[-1]
+                elif last_txn_date is not None:
+                    # No date on this line — could be a continuation transaction
+                    # from the previous date group that overflowed a page break.
+                    # If the line carries monetary values treat it as a dateless
+                    # transaction row for the most recently seen date.
+                    line_amounts = _amounts_in(line)
+                    if len(line_amounts) >= 2:
+                        cont_txns, prev_balance = _split_block_by_amount_pairs(
+                            line, last_txn_date, prev_balance, page_num
+                        )
+                        transactions.extend(cont_txns)
                 i += 1
                 continue
 
@@ -496,27 +533,47 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                 lookahead.append(nxt)
                 j += 1
 
-            # Pre-compute combined text (used by special-row checks and fallback).
-            combined = " ".join(filter(None, [rest] + lookahead))
-            amounts = _amounts_in(combined)
+            # Pre-compute combined text for special-row checks (rest only).
+            # The combined text used for the fallback is derived from all_block_lines
+            # (computed below) so it automatically excludes balance-marker content.
 
-            # "Opening balance" / "Balance Brought Forward" row — treat as
-            # account-level metadata, not a transaction.  Check only the
-            # date-line's own content (rest), not the lookahead, to avoid
-            # consuming a real transaction whose next line happens to mention
-            # a balance label (e.g. "Balance Carried Forward" summary row).
-            if re.search(r"\bopening\s+balance\b|\bbalance\s+brought\s+forward\b", rest, re.I):
-                if amounts and account.opening_balance is None:
-                    account.opening_balance = amounts[-1]
-                prev_balance = account.opening_balance or (amounts[-1] if amounts else None)
-                i = j if j > i + 1 else i + 1
-                continue
+            # "Opening balance" / "Balance Brought Forward" row — treat the date
+            # line itself as account-level metadata, not a transaction.  Check only
+            # the date-line's own content (rest), not the lookahead, to avoid
+            # consuming a real transaction whose next line happens to mention a
+            # balance label.
+            #
+            # Unlike the old behaviour (which skipped the *entire* block including
+            # the lookahead), we now let per-line splitting handle any real
+            # transaction rows that share the same date group — common when Barclays
+            # prints "Balance Brought Forward" as the first entry for a date and
+            # follows it with same-date transactions in the continuation lines.
+            is_opening_balance_row = re.search(
+                r"\bopening\s+balance\b|\bbalance\s+brought\s+forward\b", rest, re.I
+            )
+            is_closing_balance_row = re.search(
+                r"\bbalance\s+carried\s+forward\b", rest, re.I
+            )
 
-            # "Balance Carried Forward" row — record as closing balance metadata.
-            if re.search(r"\bbalance\s+carried\s+forward\b", rest, re.I):
-                if amounts and account.closing_balance is None:
-                    account.closing_balance = amounts[-1]
-                prev_balance = amounts[-1] if amounts else prev_balance
+            if is_opening_balance_row:
+                # Extract opening balance from this line only (not from the
+                # lookahead, to avoid using a later running balance by mistake).
+                rest_amounts = _amounts_in(rest)
+                if rest_amounts and account.opening_balance is None:
+                    account.opening_balance = rest_amounts[-1]
+                if prev_balance is None:
+                    prev_balance = account.opening_balance or (
+                        rest_amounts[-1] if rest_amounts else None
+                    )
+
+            # "Balance Carried Forward" row — record as closing balance metadata
+            # and skip the block (the balance-forward amount is not a transaction).
+            if is_closing_balance_row:
+                rest_amounts = _amounts_in(rest)
+                if rest_amounts and account.closing_balance is None:
+                    account.closing_balance = rest_amounts[-1]
+                prev_balance = rest_amounts[-1] if rest_amounts else prev_balance
+                last_txn_date = txn_date
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -543,7 +600,18 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             # behaviour so that edge-case PDFs are still handled.
             # ---------------------------------------------------------------
 
-            all_block_lines = ([rest] if rest else []) + lookahead
+            # For opening-balance rows, exclude rest from the transaction lines
+            # (rest contains the balance-forward marker, not a transaction).
+            # The fallback combined text is also derived from all_block_lines so
+            # that the balance-marker amount can never be misread as a transaction.
+            if is_opening_balance_row:
+                all_block_lines = lookahead
+            else:
+                all_block_lines = ([rest] if rest else []) + lookahead
+
+            # Combined text and amount list for the fallback path.
+            combined = " ".join(filter(None, all_block_lines))
+            amounts = _amounts_in(combined)
             pending_desc_parts: List[str] = []
             txns_from_block: List[NormalisedTransaction] = []
 
@@ -603,6 +671,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
 
             if txns_from_block:
                 transactions.extend(txns_from_block)
+                last_txn_date = txn_date
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -625,6 +694,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                         "insufficient for a transaction row, skipped",
                         page_num, txn_date, len(amounts),
                     )
+                last_txn_date = txn_date
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -633,6 +703,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             )
             if fallback_txns:
                 transactions.extend(fallback_txns)
+                last_txn_date = txn_date
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -667,6 +738,7 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
             )
             transactions.append(txn)
             prev_balance = balance
+            last_txn_date = txn_date
             i = j if j > i + 1 else i + 1
 
     # Infer closing balance from the last transaction's running balance
