@@ -392,6 +392,24 @@ def _parse_barclays_metadata(full_text: str) -> NormalisedAccount:
     if m:
         account.closing_balance = _parse_decimal(m.group(1))
 
+    # Total money in / total money out (Barclays statement summary section).
+    # Labels vary: "Total money in", "Payments in", "Total paid in", etc.
+    m = re.search(r"[Tt]otal\s+money\s+in\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Tt]otal\s+paid\s+in\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Pp]ayments?\s+in\s*[£]?([\d,]+\.\d{2})", full_text)
+    if m:
+        account.money_in = _parse_decimal(m.group(1))
+
+    m = re.search(r"[Tt]otal\s+money\s+out\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Tt]otal\s+paid\s+out\s*[£]?([\d,]+\.\d{2})", full_text)
+    if not m:
+        m = re.search(r"[Pp]ayments?\s+out\s*[£]?([\d,]+\.\d{2})", full_text)
+    if m:
+        account.money_out = _parse_decimal(m.group(1))
+
     return account
 
 

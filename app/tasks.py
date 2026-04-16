@@ -15,7 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.categorisation import apply_rules, UNRESOLVED_CATEGORIES
 from app.celery_app import celery_app
 from app.database import SessionLocal
-from app.models import Account, AiReport, Case, CaseException, Document, MerchantAlias, ProcessingJob, RiskFlag, Transaction, ValidationResult
+from app.models import Account, AiReport, Case, CaseException, Document, ExtractionAudit, MerchantAlias, ProcessingJob, RiskFlag, Transaction, ValidationResult
 from app.risk_flags import compute_risk_flags
 
 logger = logging.getLogger(__name__)
@@ -196,6 +196,7 @@ _EXCEPTION_TYPE_MAP: dict[str, str] = {
     "validation_failure": "validation",
     # Extraction pipeline
     "low_confidence_extraction": "extraction",
+    "incomplete_extraction": "extraction",
     # Categorisation pipeline
     "UNCATEGORISED_TRANSACTION": "categorisation",
     "uncategorised_transaction": "categorisation",
@@ -207,6 +208,7 @@ _EXCEPTION_TYPE_MAP: dict[str, str] = {
     "missing_line_suspicion": "reconciliation",
     "duplicate_transaction_suspicion": "reconciliation",
     "transaction_count_plausibility": "reconciliation",
+    "money_totals_mismatch": "reconciliation",
 }
 
 
@@ -709,6 +711,8 @@ def extract_document_task(self, document_id: str, job_id: str):
         # PDF table by physical row and typically yields a higher, more accurate count.
         # Whichever extractor returns MORE transactions is used for persistence.
         pdf_page_count = None
+        docai_count = len(extraction.transactions)
+        fallback_count = 0
         if mime_type == "application/pdf":
             from app.pdf_fallback import extract_from_pdf_text
             fallback = extract_from_pdf_text(file_bytes)
@@ -763,6 +767,8 @@ def extract_document_task(self, document_id: str, job_id: str):
             statement_end_date=acct_data.statement_end_date,
             opening_balance=acct_data.opening_balance,
             closing_balance=acct_data.closing_balance,
+            money_in=acct_data.money_in,
+            money_out=acct_data.money_out,
         )
         db.add(account)
         db.flush()
@@ -796,6 +802,11 @@ def extract_document_task(self, document_id: str, job_id: str):
                 acct_data.statement_end_date,
             )
 
+            # Resolve credit / debit columns from direction + amount for provenance.
+            _amount = float(txn_data.amount) if txn_data.amount is not None else None
+            _credit = _amount if txn_data.direction == "credit" else None
+            _debit = _amount if txn_data.direction == "debit" else None
+
             txn = Transaction(
                 transaction_id=transaction_id,
                 case_id=document.case_id,
@@ -807,6 +818,8 @@ def extract_document_task(self, document_id: str, job_id: str):
                 description_normalised=txn_data.description_normalised,
                 direction=txn_data.direction,
                 amount=txn_data.amount,
+                credit=_credit,
+                debit=_debit,
                 balance=txn_data.balance,
                 merchant_name=txn_data.merchant_name,
                 counterparty_name=counterparty,
@@ -818,14 +831,14 @@ def extract_document_task(self, document_id: str, job_id: str):
             db.add(txn)
             db.flush()
             saved_count += 1
-            _amount = float(txn_data.amount) if txn_data.amount is not None else None
             txn_list.append({
                 "transaction_id": transaction_id,
                 "date": corrected_date.isoformat() if corrected_date else None,
                 "description": txn_data.description_raw,
-                "debit": _amount if txn_data.direction == "debit" else None,
-                "credit": _amount if txn_data.direction == "credit" else None,
+                "debit": _debit,
+                "credit": _credit,
                 "balance": float(txn_data.balance) if txn_data.balance is not None else None,
+                "source_page_number": txn_data.source_page_number,
             })
 
             if txn_data.extractor_confidence < CONFIDENCE_THRESHOLD:
@@ -856,6 +869,8 @@ def extract_document_task(self, document_id: str, job_id: str):
             "document_id": document_id,
             "opening_balance": float(acct_data.opening_balance) if acct_data.opening_balance is not None else None,
             "closing_balance": float(acct_data.closing_balance) if acct_data.closing_balance is not None else None,
+            "money_in": float(acct_data.money_in) if acct_data.money_in is not None else None,
+            "money_out": float(acct_data.money_out) if acct_data.money_out is not None else None,
             "transactions": txn_list,
             "page_count": pdf_page_count,
             "statement_start_date": acct_data.statement_start_date.isoformat() if acct_data.statement_start_date else None,
@@ -881,6 +896,37 @@ def extract_document_task(self, document_id: str, job_id: str):
             }
             for f in reconciliation_result.findings
         ]
+
+        # 6. Persist extraction audit record for diagnostics.
+        from app.documentai import GOOGLE_DOCAI_PROCESSOR_ID, GOOGLE_DOCAI_PROCESSOR_VERSION
+        normalisation_summary = {
+            "docai_row_count": docai_count,
+            "fallback_row_count": fallback_count if mime_type == "application/pdf" else None,
+            "inserted_row_count": saved_count,
+            "money_in_stated": float(acct_data.money_in) if acct_data.money_in is not None else None,
+            "money_out_stated": float(acct_data.money_out) if acct_data.money_out is not None else None,
+            "reconciliation_findings": len(reconciliation_result.findings),
+        }
+        audit = ExtractionAudit(
+            extraction_run_id=f"era_{uuid4().hex[:16]}",
+            document_id=document_id,
+            case_id=document.case_id,
+            job_id=job_id,
+            processor_name=GOOGLE_DOCAI_PROCESSOR_ID,
+            processor_version=GOOGLE_DOCAI_PROCESSOR_VERSION,
+            raw_response_present=True,
+            docai_row_count=docai_count,
+            fallback_row_count=fallback_count if mime_type == "application/pdf" else None,
+            raw_row_count=max(docai_count, fallback_count),
+            normalised_row_count=len(extraction.transactions),
+            inserted_row_count=saved_count,
+            dropped_row_count=0,
+            duplicate_row_count=0,
+            reconciliation_outcome=outcome,
+            normalisation_summary_json=json.dumps(normalisation_summary),
+        )
+        db.add(audit)
+        db.commit()
 
         result = {
             "document_id": document_id,

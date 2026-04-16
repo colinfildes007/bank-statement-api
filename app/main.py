@@ -12,7 +12,7 @@ from app.auth import verify_api_key
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import (
     Account, AiReport, Case, CaseException, CounterpartyRule, Document,
-    KeywordRule, ManualOverride, MerchantAlias, MerchantRule, ProcessingJob,
+    ExtractionAudit, KeywordRule, ManualOverride, MerchantAlias, MerchantRule, ProcessingJob,
     RegexRule, RiskFlag, Transaction, ValidationResult,
     CATEGORIES, CATEGORY_CODES,
 )
@@ -1118,3 +1118,117 @@ def get_case_risk_flags(case_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Case not found")
 
     return db.query(RiskFlag).filter(RiskFlag.case_id == case_id).all()
+
+
+@app.get("/documents/{document_id}/extraction-diagnostics", dependencies=[Depends(verify_api_key)])
+def get_extraction_diagnostics(document_id: str, db: Session = Depends(get_db)):
+    """Return a full diagnostic report for a document's most recent extraction run.
+
+    Includes:
+    - raw/normalised/inserted row counts from the ExtractionAudit record
+    - dropped rows and reasons (when recorded)
+    - duplicate rows and reasons (when recorded)
+    - reconciliation outcome and findings from CaseException records
+    - money_in / money_out from the Account record
+    - exceptions raised
+    """
+    document = db.query(Document).filter(Document.document_id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Most recent audit for this document
+    audit = (
+        db.query(ExtractionAudit)
+        .filter(ExtractionAudit.document_id == document_id)
+        .order_by(ExtractionAudit.created_at.desc())
+        .first()
+    )
+
+    # Account data (first account for this document)
+    account = db.query(Account).filter(Account.document_id == document_id).first()
+
+    # Extraction exceptions
+    exceptions = (
+        db.query(CaseException)
+        .filter(CaseException.document_id == document_id)
+        .order_by(CaseException.created_at.desc())
+        .all()
+    )
+
+    # Transaction summary
+    from sqlalchemy import func as sqlfunc
+    total_txns = db.query(sqlfunc.count(Transaction.id)).filter(
+        Transaction.document_id == document_id
+    ).scalar() or 0
+    total_credit = db.query(sqlfunc.sum(Transaction.credit)).filter(
+        Transaction.document_id == document_id
+    ).scalar()
+    total_debit = db.query(sqlfunc.sum(Transaction.debit)).filter(
+        Transaction.document_id == document_id
+    ).scalar()
+
+    import json as _json
+    normalisation_summary = None
+    drop_reasons = None
+    if audit:
+        try:
+            normalisation_summary = _json.loads(audit.normalisation_summary_json) if audit.normalisation_summary_json else None
+        except Exception:
+            pass
+        try:
+            drop_reasons = _json.loads(audit.drop_reasons_json) if audit.drop_reasons_json else None
+        except Exception:
+            pass
+
+    return {
+        "document_id": document_id,
+        "case_id": document.case_id,
+        "document_status": document.status,
+        "extraction_audit": {
+            "extraction_run_id": audit.extraction_run_id if audit else None,
+            "processor_name": audit.processor_name if audit else None,
+            "processor_version": audit.processor_version if audit else None,
+            "raw_response_present": audit.raw_response_present if audit else None,
+            "docai_row_count": audit.docai_row_count if audit else None,
+            "fallback_row_count": audit.fallback_row_count if audit else None,
+            "raw_row_count": audit.raw_row_count if audit else None,
+            "normalised_row_count": audit.normalised_row_count if audit else None,
+            "inserted_row_count": audit.inserted_row_count if audit else None,
+            "dropped_row_count": audit.dropped_row_count if audit else None,
+            "duplicate_row_count": audit.duplicate_row_count if audit else None,
+            "drop_reasons": drop_reasons,
+            "reconciliation_outcome": audit.reconciliation_outcome if audit else None,
+            "normalisation_summary": normalisation_summary,
+            "created_at": audit.created_at.isoformat() if audit and audit.created_at else None,
+        } if audit else None,
+        "account_summary": {
+            "account_id": account.account_id if account else None,
+            "bank_name": account.bank_name if account else None,
+            "sort_code": account.sort_code if account else None,
+            "account_number_masked": account.account_number_masked if account else None,
+            "statement_start_date": account.statement_start_date.isoformat() if account and account.statement_start_date else None,
+            "statement_end_date": account.statement_end_date.isoformat() if account and account.statement_end_date else None,
+            "opening_balance": float(account.opening_balance) if account and account.opening_balance is not None else None,
+            "closing_balance": float(account.closing_balance) if account and account.closing_balance is not None else None,
+            "money_in_stated": float(account.money_in) if account and account.money_in is not None else None,
+            "money_out_stated": float(account.money_out) if account and account.money_out is not None else None,
+        } if account else None,
+        "transaction_summary": {
+            "total_inserted": total_txns,
+            "total_credit": float(total_credit) if total_credit is not None else None,
+            "total_debit": float(total_debit) if total_debit is not None else None,
+        },
+        "exceptions": [
+            {
+                "exception_id": e.exception_id,
+                "exception_type": e.exception_type,
+                "severity": e.severity,
+                "status": e.status,
+                "title": e.title,
+                "description": e.description,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in exceptions
+        ],
+        "exception_count": len(exceptions),
+    }
