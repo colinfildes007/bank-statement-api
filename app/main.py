@@ -86,6 +86,12 @@ def startup():
             conn.execute(
                 text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_secondary VARCHAR(100)")
             )
+            conn.execute(
+                text("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS money_in NUMERIC(18,2)")
+            )
+            conn.execute(
+                text("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS money_out NUMERIC(18,2)")
+            )
             conn.commit()
 
         # Widen any varchar(255) transaction columns that can hold long values to TEXT.
