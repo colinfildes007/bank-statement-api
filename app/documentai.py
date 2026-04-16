@@ -32,6 +32,8 @@ class NormalisedAccount:
     statement_end_date: Optional[date] = None
     opening_balance: Optional[Decimal] = None
     closing_balance: Optional[Decimal] = None
+    money_in: Optional[Decimal] = None
+    money_out: Optional[Decimal] = None
 
 
 @dataclass
@@ -366,6 +368,16 @@ def _normalise_response(document) -> ExtractionResult:
         "end_balance": "closing_balance",
         "balance_carried_forward": "closing_balance",
         "carried_forward": "closing_balance",
+        "money_in": "money_in",
+        "total_money_in": "money_in",
+        "payments_in": "money_in",
+        "total_in": "money_in",
+        "total_paid_in": "money_in",
+        "money_out": "money_out",
+        "total_money_out": "money_out",
+        "payments_out": "money_out",
+        "total_out": "money_out",
+        "total_paid_out": "money_out",
     }
 
     # Log entity types at INFO level so production logs show what the processor returned
@@ -380,7 +392,7 @@ def _normalise_response(document) -> ExtractionResult:
             field_name = account_field_map[etype]
             if field_name.endswith("_date"):
                 setattr(account, field_name, _parse_entity_date(entity))
-            elif field_name.endswith("_balance"):
+            elif field_name.endswith("_balance") or field_name in ("money_in", "money_out"):
                 setattr(account, field_name, _parse_amount(_entity_text(entity)))
             else:
                 setattr(account, field_name, _entity_text(entity))

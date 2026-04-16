@@ -270,4 +270,38 @@ class Account(Base):
     statement_end_date = Column(Date, nullable=True)
     opening_balance = Column(Numeric(precision=18, scale=2), nullable=True)
     closing_balance = Column(Numeric(precision=18, scale=2), nullable=True)
+    money_in = Column(Numeric(precision=18, scale=2), nullable=True)
+    money_out = Column(Numeric(precision=18, scale=2), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExtractionAudit(Base):
+    """Audit record written once per extraction run, capturing row-level counts
+    and reconciliation outcome for every document processed.
+
+    This table is the primary diagnostic surface for investigating incomplete
+    extraction (e.g. BS-0394A9) — it captures the raw, normalised, and
+    inserted row counts so engineers can identify exactly where rows are lost.
+    """
+
+    __tablename__ = "extraction_audits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    extraction_run_id = Column(String(100), unique=True, index=True, nullable=False)
+    document_id = Column(String(100), ForeignKey("documents.document_id"), nullable=False, index=True)
+    case_id = Column(String(100), ForeignKey("cases.case_id"), nullable=True, index=True)
+    job_id = Column(String(100), ForeignKey("processing_jobs.job_id"), nullable=True, index=True)
+    processor_name = Column(String(255), nullable=True)
+    processor_version = Column(String(100), nullable=True)
+    raw_response_present = Column(Boolean, nullable=False, default=False)
+    docai_row_count = Column(Integer, nullable=True)
+    fallback_row_count = Column(Integer, nullable=True)
+    raw_row_count = Column(Integer, nullable=True)
+    normalised_row_count = Column(Integer, nullable=True)
+    inserted_row_count = Column(Integer, nullable=True)
+    dropped_row_count = Column(Integer, nullable=True)
+    duplicate_row_count = Column(Integer, nullable=True)
+    drop_reasons_json = Column(Text, nullable=True)
+    reconciliation_outcome = Column(String(50), nullable=True)
+    normalisation_summary_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -362,8 +362,14 @@ def check_transaction_count_plausibility(extracted_data: dict) -> list:
 
 def check_duplicate_transactions(extracted_data: dict) -> list:
     """
-    Detect transactions that share the same date, debit/credit amounts,
-    and description — a strong signal of accidental duplication.
+    Detect transactions that share the same date, amounts, balance, and
+    description — a strong signal of accidental duplication.
+
+    The deduplication key intentionally includes the running balance and page
+    number (when available) so that legitimate repeated transactions (e.g. five
+    TUI refunds of the same amount on the same date, or repeated same-amount
+    transfers to savings) are NOT collapsed into a single record.  Using only
+    date + description + amount would incorrectly suppress these valid rows.
     """
     findings = []
     transactions = extracted_data.get("transactions", [])
@@ -375,7 +381,9 @@ def check_duplicate_transactions(extracted_data: dict) -> list:
             txn.get("date"),
             str(txn.get("debit")),
             str(txn.get("credit")),
+            str(txn.get("balance")),
             (txn.get("description") or "").strip().lower(),
+            txn.get("source_page_number"),
         )
         if key in seen:
             findings.append(ReconciliationFinding(
@@ -383,13 +391,144 @@ def check_duplicate_transactions(extracted_data: dict) -> list:
                 severity="Medium",
                 title=f"Possible duplicate transaction: {txn_id}",
                 description=(
-                    f"Transaction {txn_id} has the same date, amount, and "
+                    f"Transaction {txn_id} has the same date, amount, balance, and "
                     f"description as transaction {seen[key]}."
                 ),
                 transaction_id=txn_id,
             ))
         else:
             seen[key] = txn_id
+
+    return findings
+
+
+def check_money_totals(extracted_data: dict) -> list:
+    """
+    Compare the sum of extracted debits/credits against the stated money_in
+    and money_out totals from the statement header.
+
+    This check catches the case where a subset of transactions was extracted
+    (e.g. only 74 of 195 rows) but the running-balance chain is accidentally
+    self-consistent within that subset — the money totals will still diverge
+    from the header figures even if no individual balance-continuity error fires.
+
+    A total mismatch exceeding 1p is reported as Critical because it proves
+    the extracted set is incomplete or incorrect.
+    """
+    findings = []
+    stated_money_in = _to_decimal(extracted_data.get("money_in"))
+    stated_money_out = _to_decimal(extracted_data.get("money_out"))
+
+    if stated_money_in is None and stated_money_out is None:
+        return findings
+
+    transactions = extracted_data.get("transactions", [])
+    tolerance = Decimal("0.01")
+
+    extracted_in = sum(
+        (c for c in (_to_decimal(t.get("credit")) for t in transactions) if c is not None),
+        Decimal("0"),
+    )
+    extracted_out = sum(
+        (d for d in (_to_decimal(t.get("debit")) for t in transactions) if d is not None),
+        Decimal("0"),
+    )
+
+    if stated_money_in is not None and abs(extracted_in - stated_money_in) > tolerance:
+        findings.append(ReconciliationFinding(
+            check="money_totals_mismatch",
+            severity="Critical",
+            title="Extracted money-in total does not match statement header",
+            description=(
+                f"Statement header shows money in = {stated_money_in:.2f} but the sum "
+                f"of extracted credit amounts is {extracted_in:.2f} "
+                f"(difference: {abs(extracted_in - stated_money_in):.2f}). "
+                "This strongly indicates incomplete extraction."
+            ),
+        ))
+
+    if stated_money_out is not None and abs(extracted_out - stated_money_out) > tolerance:
+        findings.append(ReconciliationFinding(
+            check="money_totals_mismatch",
+            severity="Critical",
+            title="Extracted money-out total does not match statement header",
+            description=(
+                f"Statement header shows money out = {stated_money_out:.2f} but the sum "
+                f"of extracted debit amounts is {extracted_out:.2f} "
+                f"(difference: {abs(extracted_out - stated_money_out):.2f}). "
+                "This strongly indicates incomplete extraction."
+            ),
+        ))
+
+    return findings
+
+
+def check_incomplete_extraction(extracted_data: dict) -> list:
+    """
+    Detect severely under-extracted statements by comparing the extracted
+    transaction count against:
+
+      1. The expected count supplied by the caller (``expected_transaction_count``
+         key in *extracted_data*), when present.
+      2. An estimate derived from money_in + money_out divided by a typical
+         average transaction value (£50), when statement totals are available.
+
+    A count below 50 % of the expected figure is reported as High — the
+    extraction must be considered incomplete until proven otherwise.  A count
+    below 25 % is Critical.
+    """
+    findings = []
+    count = len(extracted_data.get("transactions", []))
+
+    # Sub-check 1: explicit expected count supplied by caller.
+    expected = extracted_data.get("expected_transaction_count")
+    if isinstance(expected, int) and expected > 0:
+        ratio = count / expected
+        if ratio < 0.25:
+            findings.append(ReconciliationFinding(
+                check="incomplete_extraction",
+                severity="Critical",
+                title="Critically incomplete extraction — fewer than 25 % of expected transactions",
+                description=(
+                    f"Only {count} transaction(s) were extracted but {expected} are expected "
+                    f"({ratio * 100:.0f} %). The extraction must be considered incomplete. "
+                    "Manual review and re-extraction are required."
+                ),
+            ))
+        elif ratio < 0.50:
+            findings.append(ReconciliationFinding(
+                check="incomplete_extraction",
+                severity="High",
+                title="Incomplete extraction suspected — fewer than 50 % of expected transactions",
+                description=(
+                    f"Only {count} transaction(s) were extracted but {expected} are expected "
+                    f"({ratio * 100:.0f} %). This may indicate parser truncation, "
+                    "continuation-page loss, or silent deduplication. "
+                    "Manual review recommended."
+                ),
+            ))
+        return findings
+
+    # Sub-check 2: estimate from money totals when no explicit count is given.
+    stated_in = _to_decimal(extracted_data.get("money_in"))
+    stated_out = _to_decimal(extracted_data.get("money_out"))
+    if stated_in is not None or stated_out is not None:
+        total_flow = (stated_in or Decimal("0")) + (stated_out or Decimal("0"))
+        # Estimate: assume an average transaction value of £50 (conservative).
+        _AVG_TXN_VALUE = Decimal("50")
+        if total_flow > 0:
+            estimated = int(total_flow / _AVG_TXN_VALUE)
+            if estimated > 0 and count < estimated // 2:
+                findings.append(ReconciliationFinding(
+                    check="incomplete_extraction",
+                    severity="High",
+                    title="Incomplete extraction suspected — extracted count far below estimate",
+                    description=(
+                        f"Only {count} transaction(s) were extracted. Based on stated "
+                        f"money flow of {total_flow:.2f} an estimated {estimated} transactions "
+                        "would be expected. This may indicate incomplete extraction."
+                    ),
+                ))
 
     return findings
 
@@ -430,5 +569,12 @@ def run_reconciliation(extracted_data: dict) -> ReconciliationResult:
 
     # 5. Plausibility checks (sparse extraction detection)
     findings.extend(check_transaction_count_plausibility(extracted_data))
+
+    # 6. Money-totals cross-check (catches incomplete extraction even when
+    #    the running-balance chain is accidentally self-consistent).
+    findings.extend(check_money_totals(extracted_data))
+
+    # 7. Explicit incomplete-extraction check.
+    findings.extend(check_incomplete_extraction(extracted_data))
 
     return ReconciliationResult(passed=len(findings) == 0, findings=findings)
