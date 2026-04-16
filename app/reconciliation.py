@@ -26,6 +26,7 @@ reconciliation degrades gracefully when fields are absent):
 """
 
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -72,6 +73,14 @@ class ReconciliationResult:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+# Divisor used by check_transaction_count_plausibility to compute a minimum
+# expected transaction count from the statement period length in days.
+# A value of 10 means "at least 1 transaction per 10 days" — deliberately
+# conservative so that very quiet personal accounts are not falsely flagged.
+# Only applied to statements of 14+ days (shorter periods have too little
+# signal to be useful).
+_MIN_TXNS_PERIOD_DIVISOR = 10
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
     """Safely coerce *value* to a Decimal. Returns None on failure."""
@@ -275,6 +284,82 @@ def check_missing_lines(extracted_data: dict) -> list:
     return findings
 
 
+def check_transaction_count_plausibility(extracted_data: dict) -> list:
+    """
+    Heuristic check: flag if the extracted transaction count is suspiciously low
+    relative to the PDF page count or the statement period length.
+
+    This detects silent under-extraction — for example, when Document AI groups
+    multiple same-date transactions into a single entity — that would otherwise
+    pass all balance-chain checks because the subset of extracted running balances
+    can still be self-consistent.
+
+    Two independent sub-checks are run:
+
+    1. **Page count**: real bank statements contain at least one transaction per
+       page, so ``count < page_count`` is a strong signal of under-extraction.
+    2. **Period length**: for statements of 14+ days, we expect at least
+       ``max(2, period_days // 10)`` transactions.  This is deliberately
+       conservative (a very quiet account may have few transactions).
+
+    Both sub-checks produce Medium severity findings so they are surfaced as
+    warnings rather than blocking failures.
+    """
+    findings = []
+    transactions = extracted_data.get("transactions", [])
+    count = len(transactions)
+
+    # Sub-check 1: fewer transactions than pages is suspicious for any real statement.
+    page_count = extracted_data.get("page_count")
+    if isinstance(page_count, int) and page_count > 0 and count < page_count:
+        findings.append(ReconciliationFinding(
+            check="transaction_count_plausibility",
+            severity="Medium",
+            title="Fewer transactions than PDF pages",
+            description=(
+                f"Only {count} transaction(s) were extracted from a {page_count}-page "
+                "PDF. Real bank statements typically contain at least one transaction "
+                "per page. This may indicate incomplete extraction. Manual review "
+                "recommended."
+            ),
+        ))
+
+    # Sub-check 2: count vs statement period length.
+    start_raw = extracted_data.get("statement_start_date")
+    end_raw = extracted_data.get("statement_end_date")
+    if start_raw and end_raw:
+        try:
+            start = (
+                date.fromisoformat(str(start_raw))
+                if not isinstance(start_raw, date)
+                else start_raw
+            )
+            end = (
+                date.fromisoformat(str(end_raw))
+                if not isinstance(end_raw, date)
+                else end_raw
+            )
+            period_days = (end - start).days
+            if period_days >= 14:
+                min_expected = max(2, period_days // _MIN_TXNS_PERIOD_DIVISOR)
+                if count < min_expected:
+                    findings.append(ReconciliationFinding(
+                        check="transaction_count_plausibility",
+                        severity="Medium",
+                        title="Suspiciously low transaction count for statement period",
+                        description=(
+                            f"Only {count} transaction(s) were extracted for a "
+                            f"{period_days}-day statement period (expected at least "
+                            f"{min_expected}). This may indicate incomplete extraction. "
+                            "Manual review recommended."
+                        ),
+                    ))
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    return findings
+
+
 def check_duplicate_transactions(extracted_data: dict) -> list:
     """
     Detect transactions that share the same date, debit/credit amounts,
@@ -342,5 +427,8 @@ def run_reconciliation(extracted_data: dict) -> ReconciliationResult:
 
     # 4. Duplication checks
     findings.extend(check_duplicate_transactions(extracted_data))
+
+    # 5. Plausibility checks (sparse extraction detection)
+    findings.extend(check_transaction_count_plausibility(extracted_data))
 
     return ReconciliationResult(passed=len(findings) == 0, findings=findings)

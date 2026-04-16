@@ -206,6 +206,7 @@ _EXCEPTION_TYPE_MAP: dict[str, str] = {
     "running_balance_consistency": "reconciliation",
     "missing_line_suspicion": "reconciliation",
     "duplicate_transaction_suspicion": "reconciliation",
+    "transaction_count_plausibility": "reconciliation",
 }
 
 
@@ -707,9 +708,14 @@ def extract_document_task(self, document_id: str, job_id: str):
         # significantly under-counting individual rows.  The text parser iterates the
         # PDF table by physical row and typically yields a higher, more accurate count.
         # Whichever extractor returns MORE transactions is used for persistence.
+        pdf_page_count = None
         if mime_type == "application/pdf":
             from app.pdf_fallback import extract_from_pdf_text
             fallback = extract_from_pdf_text(file_bytes)
+            # Page count is populated by the fallback parser (avoids reading the PDF twice).
+            pdf_page_count = fallback.page_count or None
+            if pdf_page_count:
+                logger.info("PDF page count for document %s: %d page(s)", document_id, pdf_page_count)
             docai_count = len(extraction.transactions)
             fallback_count = len(fallback.transactions)
             logger.info(
@@ -730,6 +736,13 @@ def extract_document_task(self, document_id: str, job_id: str):
                     document_id,
                 )
             else:
+                if docai_count > 0 and docai_count == fallback_count:
+                    logger.warning(
+                        "Document AI and text fallback both returned exactly %d transaction(s) "
+                        "for document %s — identical counts from two independent parsers may "
+                        "indicate a shared extraction ceiling. Manual review recommended.",
+                        docai_count, document_id,
+                    )
                 logger.info(
                     "Keeping Document AI result for document %s (%d >= %d transaction(s))",
                     document_id, docai_count, fallback_count,
@@ -844,6 +857,9 @@ def extract_document_task(self, document_id: str, job_id: str):
             "opening_balance": float(acct_data.opening_balance) if acct_data.opening_balance is not None else None,
             "closing_balance": float(acct_data.closing_balance) if acct_data.closing_balance is not None else None,
             "transactions": txn_list,
+            "page_count": pdf_page_count,
+            "statement_start_date": acct_data.statement_start_date.isoformat() if acct_data.statement_start_date else None,
+            "statement_end_date": acct_data.statement_end_date.isoformat() if acct_data.statement_end_date else None,
         }
         reconciliation_result = run_reconciliation(extracted_data)
 
