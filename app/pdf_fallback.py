@@ -229,6 +229,11 @@ def _split_block_by_amount_pairs(
                 desc_parts = []
                 pending_amount = None
 
+    if pending_amount is not None:
+        logger.debug(
+            "pdf_fallback: lone amount %.2f on %s has no paired balance — skipped",
+            float(pending_amount), txn_date,
+        )
     return txns, prev_balance
 
 
@@ -614,6 +619,12 @@ def _parse_transactions(pages: List[str], account: NormalisedAccount) -> List[No
                         amounts[0], txn_date,
                     )
                     prev_balance = amounts[0]
+                elif amounts:
+                    logger.debug(
+                        "pdf_fallback: date block on page %d (%s) has only %d amount(s) — "
+                        "insufficient for a transaction row, skipped",
+                        page_num, txn_date, len(amounts),
+                    )
                 i = j if j > i + 1 else i + 1
                 continue
 
@@ -692,7 +703,7 @@ def extract_from_pdf_text(file_bytes: bytes) -> ExtractionResult:
 
     lower = full_text.lower()
     bank = next((b for b in _KNOWN_BANKS if b in lower), None)
-    logger.info("pdf_fallback: detected bank=%r, text_length=%d", bank, len(full_text))
+    logger.info("pdf_fallback: detected bank=%r, text_length=%d, page_count=%d", bank, len(full_text), len(pages))
 
     if bank == "barclays":
         account = _parse_barclays_metadata(full_text)
@@ -705,4 +716,4 @@ def extract_from_pdf_text(file_bytes: bytes) -> ExtractionResult:
         "pdf_fallback: extracted %d transaction(s) for bank=%r",
         len(transactions), bank,
     )
-    return ExtractionResult(account=account, transactions=transactions)
+    return ExtractionResult(account=account, transactions=transactions, page_count=len(pages))

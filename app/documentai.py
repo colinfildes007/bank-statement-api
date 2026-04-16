@@ -54,6 +54,7 @@ class NormalisedTransaction:
 class ExtractionResult:
     account: NormalisedAccount = field(default_factory=NormalisedAccount)
     transactions: list = field(default_factory=list)
+    page_count: int = 0
 
 
 def _get_processor_client():
@@ -294,11 +295,13 @@ def process_document(file_bytes: bytes, mime_type: str) -> ExtractionResult:
 
     entity_count = len(document.entities) if document.entities else 0
     doc_text_len = len(document.text) if document.text else 0
+    doc_page_count = len(document.pages) if document.pages else 0
     logger.info(
-        "Document AI response for processor %s: text_length=%d, entity_count=%d",
+        "Document AI response for processor %s: text_length=%d, entity_count=%d, page_count=%d",
         GOOGLE_DOCAI_PROCESSOR_ID,
         doc_text_len,
         entity_count,
+        doc_page_count,
     )
     if logger.isEnabledFor(logging.DEBUG) and entity_count:
         entity_types_raw = sorted({(e.type_ or "").lower() for e in document.entities})
