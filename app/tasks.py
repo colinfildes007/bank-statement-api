@@ -1014,10 +1014,19 @@ def categorise_document_task(self, document_id: str, job_id: str):
         # Load merchant aliases once for the whole batch to avoid N DB queries
         merchant_aliases = db.query(MerchantAlias).all()
 
+        # Threshold below which a transaction_type-fallback categorisation is
+        # considered low-confidence and the transaction is flagged for review.
+        # Transactions whose category was derived only from the payment-code
+        # prefix (DD/BGC/SO/etc.) with no specific rule match and whose amount
+        # is above this threshold warrant manual attention because the generic
+        # category (e.g. "household_bills") may not be accurate.
+        _LOW_CONFIDENCE_REVIEW_THRESHOLD = Decimal("200")
+
         for txn in transactions:
-            category, source, rule_id = apply_rules(db, txn, aliases=merchant_aliases)
+            category, source, rule_id, subcategory = apply_rules(db, txn, aliases=merchant_aliases)
             txn.category = category
             txn.category_primary = category
+            txn.category_secondary = subcategory
             txn.category_source = source
             txn.rule_id = rule_id
 
@@ -1063,6 +1072,16 @@ def categorise_document_task(self, document_id: str, job_id: str):
                     )
                     db.add(exc)
                     exceptions_created += 1
+            elif source == "transaction_type":
+                # Low-confidence categorisation: matched only by payment-code
+                # fallback (no specific rule).  Flag high-value transactions for
+                # review so analysts can verify the generic category is correct.
+                txn_amount = txn.amount or Decimal("0")
+                if txn_amount >= _LOW_CONFIDENCE_REVIEW_THRESHOLD:
+                    txn.needs_review = True
+                else:
+                    txn.needs_review = False
+                categorised_count += 1
             else:
                 txn.needs_review = False
                 categorised_count += 1
