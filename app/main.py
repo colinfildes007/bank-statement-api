@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -118,72 +119,413 @@ def startup():
         _seed_default_rules()
 
 
-# Default categorisation keyword rules for common UK bank transaction prefixes.
-# These are seeded once at startup only when the keyword_rules table is empty,
-# so they will not overwrite rules created by users via the API.
+def _stable_rule_id(prefix: str, *parts: str) -> str:
+    """Generate a deterministic rule ID for a default seeded rule.
+
+    Uses the first 8 hex characters of a SHA-256 hash over the joined parts so
+    that the same rule always gets the same ID.  This enables idempotent
+    per-rule seeding: new default rules added in code updates are added to
+    existing deployments without overwriting rules created by users (which have
+    random IDs like ``kr_abc12345``).
+    """
+    content = "|".join(parts)
+    return f"{prefix}_{hashlib.sha256(content.encode()).hexdigest()[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# Default categorisation rules seeded at startup.
+# ---------------------------------------------------------------------------
+# Each entry is a dict consumed by _seed_default_rules().
+# Priority values within each rule type determine which rule fires first when
+# multiple rules match (lower number = higher priority).
+# ---------------------------------------------------------------------------
+
+# Income keyword rules
 _DEFAULT_KEYWORD_RULES = [
-    # Income
-    {"keyword": "BGC",     "category": "income",           "match_type": "startswith", "priority": 10},
-    {"keyword": "BACS",    "category": "income",           "match_type": "startswith", "priority": 11},
-    {"keyword": "SALARY",  "category": "income",           "match_type": "contains",   "priority": 12},
-    {"keyword": "WAGES",   "category": "income",           "match_type": "contains",   "priority": 13},
-    {"keyword": "PAYROLL", "category": "income",           "match_type": "contains",   "priority": 14},
-    {"keyword": "CDT",     "category": "income",           "match_type": "startswith", "priority": 15},
-    # Household bills
-    {"keyword": "DD",      "category": "household_bills",  "match_type": "startswith", "priority": 20},
-    {"keyword": "SO",      "category": "household_bills",  "match_type": "startswith", "priority": 21},
-    {"keyword": "BP",      "category": "household_bills",  "match_type": "startswith", "priority": 22},
-    # Everyday spending
-    {"keyword": "VIS",     "category": "everyday_spending","match_type": "startswith", "priority": 30},
-    {"keyword": "VISA",    "category": "everyday_spending","match_type": "startswith", "priority": 31},
-    {"keyword": "POS",     "category": "everyday_spending","match_type": "startswith", "priority": 32},
-    {"keyword": "DEB",     "category": "everyday_spending","match_type": "startswith", "priority": 33},
+    # Bank payment type prefixes
+    {"keyword": "BGC",              "category": "income",            "match_type": "startswith", "priority": 10},
+    {"keyword": "BACS",             "category": "income",            "match_type": "startswith", "priority": 11},
+    {"keyword": "CDT",              "category": "income",            "match_type": "startswith", "priority": 12},
+    # Employment income
+    {"keyword": "SALARY",           "category": "income",            "match_type": "contains",   "priority": 15},
+    {"keyword": "WAGES",            "category": "income",            "match_type": "contains",   "priority": 16},
+    {"keyword": "PAYROLL",          "category": "income",            "match_type": "contains",   "priority": 17},
+    # Benefits & pensions
+    {"keyword": "PENSION",          "category": "income",            "match_type": "contains",   "priority": 20},
+    {"keyword": "UNIVERSAL CREDIT", "category": "income",            "match_type": "contains",   "priority": 21},
+    {"keyword": "CHILD BENEFIT",    "category": "income",            "match_type": "contains",   "priority": 22},
+    {"keyword": "TAX CREDIT",       "category": "income",            "match_type": "contains",   "priority": 23},
+    {"keyword": "WORKING TAX",      "category": "income",            "match_type": "contains",   "priority": 24},
+    {"keyword": "HMRC PAYE",        "category": "income",            "match_type": "contains",   "priority": 25},
+    {"keyword": "DIVIDEND",         "category": "income",            "match_type": "contains",   "priority": 26},
+    {"keyword": "INTEREST RECEIVED","category": "income",            "match_type": "contains",   "priority": 27},
+    # Household bills — payment type prefixes
+    {"keyword": "DD",               "category": "household_bills",   "match_type": "startswith", "priority": 30},
+    {"keyword": "SO",               "category": "household_bills",   "match_type": "startswith", "priority": 31},
+    {"keyword": "BP",               "category": "household_bills",   "match_type": "startswith", "priority": 32},
+    # Rent / mortgage
+    {"keyword": "MORTGAGE",         "category": "household_bills",   "match_type": "contains",   "priority": 35},
+    {"keyword": "RENT",             "category": "household_bills",   "match_type": "contains",   "priority": 36},
+    {"keyword": "COUNCIL TAX",      "category": "household_bills",   "match_type": "contains",   "priority": 37},
+    # Utilities
+    {"keyword": "WATER RATES",      "category": "household_bills",   "match_type": "contains",   "priority": 40},
+    {"keyword": "GAS AND ELECTRIC", "category": "household_bills",   "match_type": "contains",   "priority": 41},
+    {"keyword": "ENERGY",           "category": "household_bills",   "match_type": "contains",   "priority": 42},
+    {"keyword": "ELECTRIC",         "category": "household_bills",   "match_type": "contains",   "priority": 43},
+    {"keyword": "BRITISH GAS",      "category": "household_bills",   "match_type": "contains",   "priority": 44},
+    {"keyword": "SCOTTISH POWER",   "category": "household_bills",   "match_type": "contains",   "priority": 45},
+    {"keyword": "EON",              "category": "household_bills",   "match_type": "contains",   "priority": 46},
+    {"keyword": "NPOWER",           "category": "household_bills",   "match_type": "contains",   "priority": 47},
+    {"keyword": "THAMES WATER",     "category": "household_bills",   "match_type": "contains",   "priority": 48},
+    {"keyword": "ANGLIAN WATER",    "category": "household_bills",   "match_type": "contains",   "priority": 49},
+    {"keyword": "SEVERN TRENT",     "category": "household_bills",   "match_type": "contains",   "priority": 50},
+    # Telecoms & media
+    {"keyword": "BROADBAND",        "category": "household_bills",   "match_type": "contains",   "priority": 53},
+    {"keyword": "TALKTALK",         "category": "household_bills",   "match_type": "contains",   "priority": 54},
+    {"keyword": "TV LICENCE",       "category": "household_bills",   "match_type": "contains",   "priority": 55},
+    {"keyword": "TV LICENSE",       "category": "household_bills",   "match_type": "contains",   "priority": 56},
+    # Insurance
+    {"keyword": "INSURANCE",        "category": "household_bills",   "match_type": "contains",   "priority": 58},
+    # Everyday spending — card payment prefixes
+    {"keyword": "VIS",              "category": "everyday_spending", "match_type": "startswith", "priority": 60},
+    {"keyword": "VISA",             "category": "everyday_spending", "match_type": "startswith", "priority": 61},
+    {"keyword": "POS",              "category": "everyday_spending", "match_type": "startswith", "priority": 62},
+    {"keyword": "DEB",              "category": "everyday_spending", "match_type": "startswith", "priority": 63},
+    # Supermarkets / groceries
+    {"keyword": "TESCO",            "category": "everyday_spending", "match_type": "contains",   "priority": 65},
+    {"keyword": "SAINSBURY",        "category": "everyday_spending", "match_type": "contains",   "priority": 66},
+    {"keyword": "ASDA",             "category": "everyday_spending", "match_type": "contains",   "priority": 67},
+    {"keyword": "MORRISONS",        "category": "everyday_spending", "match_type": "contains",   "priority": 68},
+    {"keyword": "WAITROSE",         "category": "everyday_spending", "match_type": "contains",   "priority": 69},
+    {"keyword": "LIDL",             "category": "everyday_spending", "match_type": "contains",   "priority": 70},
+    {"keyword": "ALDI",             "category": "everyday_spending", "match_type": "contains",   "priority": 71},
+    {"keyword": "MARKS SPENCER",    "category": "everyday_spending", "match_type": "contains",   "priority": 72},
+    {"keyword": "ICELAND",          "category": "everyday_spending", "match_type": "contains",   "priority": 73},
+    {"keyword": "FARMFOODS",        "category": "everyday_spending", "match_type": "contains",   "priority": 74},
+    {"keyword": "SPAR",             "category": "everyday_spending", "match_type": "contains",   "priority": 75},
+    # Fast food & coffee
+    {"keyword": "MCDONALDS",        "category": "everyday_spending", "match_type": "contains",   "priority": 76},
+    {"keyword": "KFC",              "category": "everyday_spending", "match_type": "contains",   "priority": 77},
+    {"keyword": "SUBWAY",           "category": "everyday_spending", "match_type": "contains",   "priority": 78},
+    {"keyword": "GREGGS",           "category": "everyday_spending", "match_type": "contains",   "priority": 79},
+    {"keyword": "STARBUCKS",        "category": "everyday_spending", "match_type": "contains",   "priority": 80},
+    {"keyword": "COSTA COFFEE",     "category": "everyday_spending", "match_type": "contains",   "priority": 81},
+    {"keyword": "PRET A MANGER",    "category": "everyday_spending", "match_type": "contains",   "priority": 82},
+    {"keyword": "NANDOS",           "category": "everyday_spending", "match_type": "contains",   "priority": 83},
+    {"keyword": "PIZZA EXPRESS",    "category": "everyday_spending", "match_type": "contains",   "priority": 84},
+    {"keyword": "PIZZA HUT",        "category": "everyday_spending", "match_type": "contains",   "priority": 85},
+    {"keyword": "DOMINOS",          "category": "everyday_spending", "match_type": "contains",   "priority": 86},
+    # Food delivery
+    {"keyword": "DELIVEROO",        "category": "everyday_spending", "match_type": "contains",   "priority": 87},
+    {"keyword": "JUST EAT",         "category": "everyday_spending", "match_type": "contains",   "priority": 88},
+    {"keyword": "UBER EATS",        "category": "everyday_spending", "match_type": "contains",   "priority": 89},
+    # Online shopping / retail
+    {"keyword": "AMAZON",           "category": "everyday_spending", "match_type": "contains",   "priority": 90},
+    {"keyword": "EBAY",             "category": "everyday_spending", "match_type": "contains",   "priority": 91},
+    {"keyword": "ARGOS",            "category": "everyday_spending", "match_type": "contains",   "priority": 92},
+    {"keyword": "IKEA",             "category": "everyday_spending", "match_type": "contains",   "priority": 93},
+    {"keyword": "PRIMARK",          "category": "everyday_spending", "match_type": "contains",   "priority": 94},
+    {"keyword": "ASOS",             "category": "everyday_spending", "match_type": "contains",   "priority": 95},
+    {"keyword": "JD SPORTS",        "category": "everyday_spending", "match_type": "contains",   "priority": 96},
+    {"keyword": "SPORTS DIRECT",    "category": "everyday_spending", "match_type": "contains",   "priority": 97},
+    {"keyword": "CURRYS",           "category": "everyday_spending", "match_type": "contains",   "priority": 98},
     # Transport
-    {"keyword": "TFL",       "category": "transport",      "match_type": "contains",   "priority": 40},
-    {"keyword": "TRAINLINE", "category": "transport",      "match_type": "contains",   "priority": 41},
-    {"keyword": "UBER",      "category": "transport",      "match_type": "contains",   "priority": 42},
-    # Financial / banking
-    {"keyword": "ATM",      "category": "financial_banking","match_type": "startswith", "priority": 50},
-    {"keyword": "CHQ",      "category": "financial_banking","match_type": "startswith", "priority": 51},
-    {"keyword": "CHEQUE",   "category": "financial_banking","match_type": "startswith", "priority": 52},
-    {"keyword": "TFR",      "category": "financial_banking","match_type": "startswith", "priority": 53},
-    {"keyword": "TRANSFER", "category": "financial_banking","match_type": "startswith", "priority": 54},
-    {"keyword": "FPS",      "category": "financial_banking","match_type": "startswith", "priority": 55},
-    {"keyword": "INT",      "category": "financial_banking","match_type": "startswith", "priority": 56},
-    {"keyword": "REF",      "category": "financial_banking","match_type": "startswith", "priority": 57},
-    {"keyword": "REFUND",   "category": "financial_banking","match_type": "startswith", "priority": 58},
+    {"keyword": "TFL",              "category": "transport",         "match_type": "contains",   "priority": 100},
+    {"keyword": "TRAINLINE",        "category": "transport",         "match_type": "contains",   "priority": 101},
+    {"keyword": "NATIONAL RAIL",    "category": "transport",         "match_type": "contains",   "priority": 102},
+    {"keyword": "AVANTI",           "category": "transport",         "match_type": "contains",   "priority": 103},
+    {"keyword": "GREAT WESTERN",    "category": "transport",         "match_type": "contains",   "priority": 104},
+    {"keyword": "EAST MIDLANDS",    "category": "transport",         "match_type": "contains",   "priority": 105},
+    {"keyword": "HEATHROW EXPRESS", "category": "transport",         "match_type": "contains",   "priority": 106},
+    {"keyword": "UBER",             "category": "transport",         "match_type": "contains",   "priority": 107},
+    {"keyword": "ADDISON LEE",      "category": "transport",         "match_type": "contains",   "priority": 108},
+    {"keyword": "RYANAIR",          "category": "transport",         "match_type": "contains",   "priority": 109},
+    {"keyword": "EASYJET",          "category": "transport",         "match_type": "contains",   "priority": 110},
+    {"keyword": "BRITISH AIRWAYS",  "category": "transport",         "match_type": "contains",   "priority": 111},
+    {"keyword": "JET2",             "category": "transport",         "match_type": "contains",   "priority": 112},
+    {"keyword": "VIRGIN ATLANTIC",  "category": "transport",         "match_type": "contains",   "priority": 113},
+    {"keyword": "PARKING",          "category": "transport",         "match_type": "contains",   "priority": 114},
+    {"keyword": "CAR PARK",         "category": "transport",         "match_type": "contains",   "priority": 115},
+    {"keyword": "PETROL",           "category": "transport",         "match_type": "contains",   "priority": 116},
+    {"keyword": "SHELL PETROL",     "category": "transport",         "match_type": "contains",   "priority": 117},
+    {"keyword": "BP GARAGE",        "category": "transport",         "match_type": "contains",   "priority": 118},
+    {"keyword": "ESSO",             "category": "transport",         "match_type": "contains",   "priority": 119},
+    # Financial & banking
+    {"keyword": "ATM",              "category": "financial_banking", "match_type": "startswith", "priority": 120},
+    {"keyword": "CHQ",              "category": "financial_banking", "match_type": "startswith", "priority": 121},
+    {"keyword": "CHEQUE",           "category": "financial_banking", "match_type": "startswith", "priority": 122},
+    {"keyword": "TFR",              "category": "financial_banking", "match_type": "startswith", "priority": 123},
+    {"keyword": "TRANSFER",         "category": "financial_banking", "match_type": "startswith", "priority": 124},
+    {"keyword": "FPS",              "category": "financial_banking", "match_type": "startswith", "priority": 125},
+    {"keyword": "INT",              "category": "financial_banking", "match_type": "startswith", "priority": 126},
+    {"keyword": "REFUND",           "category": "financial_banking", "match_type": "startswith", "priority": 127},
+    {"keyword": "PAYPAL",           "category": "financial_banking", "match_type": "contains",   "priority": 128},
+    {"keyword": "WISE",             "category": "financial_banking", "match_type": "contains",   "priority": 129},
+    {"keyword": "LOAN REPAYMENT",   "category": "financial_banking", "match_type": "contains",   "priority": 130},
+    {"keyword": "CREDIT CARD",      "category": "financial_banking", "match_type": "contains",   "priority": 131},
+    {"keyword": "BANK CHARGE",      "category": "financial_banking", "match_type": "contains",   "priority": 132},
+    {"keyword": "OVERDRAFT FEE",    "category": "financial_banking", "match_type": "contains",   "priority": 133},
+    # Health & personal care
+    {"keyword": "BOOTS",            "category": "health_personal",   "match_type": "contains",   "priority": 140},
+    {"keyword": "SUPERDRUG",        "category": "health_personal",   "match_type": "contains",   "priority": 141},
+    {"keyword": "LLOYDS PHARMACY",  "category": "health_personal",   "match_type": "contains",   "priority": 142},
+    {"keyword": "PHARMACY",         "category": "health_personal",   "match_type": "contains",   "priority": 143},
+    {"keyword": "PRESCRIPTION",     "category": "health_personal",   "match_type": "contains",   "priority": 144},
+    {"keyword": "NHS",              "category": "health_personal",   "match_type": "contains",   "priority": 145},
+    {"keyword": "BUPA",             "category": "health_personal",   "match_type": "contains",   "priority": 146},
+    {"keyword": "VITALITY",         "category": "health_personal",   "match_type": "contains",   "priority": 147},
+    {"keyword": "DENTIST",          "category": "health_personal",   "match_type": "contains",   "priority": 148},
+    {"keyword": "SPECSAVERS",       "category": "health_personal",   "match_type": "contains",   "priority": 149},
+    {"keyword": "VISION EXPRESS",   "category": "health_personal",   "match_type": "contains",   "priority": 150},
+    {"keyword": "PUREGYM",          "category": "health_personal",   "match_type": "contains",   "priority": 151},
+    {"keyword": "THE GYM",          "category": "health_personal",   "match_type": "contains",   "priority": 152},
+    {"keyword": "NUFFIELD HEALTH",  "category": "health_personal",   "match_type": "contains",   "priority": 153},
+    {"keyword": "DAVID LLOYD",      "category": "health_personal",   "match_type": "contains",   "priority": 154},
+    {"keyword": "VIRGIN ACTIVE",    "category": "health_personal",   "match_type": "contains",   "priority": 155},
+    {"keyword": "ANYTIME FITNESS",  "category": "health_personal",   "match_type": "contains",   "priority": 156},
+    # Leisure & lifestyle
+    {"keyword": "NETFLIX",          "category": "leisure_lifestyle", "match_type": "contains",   "priority": 160},
+    {"keyword": "SPOTIFY",          "category": "leisure_lifestyle", "match_type": "contains",   "priority": 161},
+    {"keyword": "APPLE MUSIC",      "category": "leisure_lifestyle", "match_type": "contains",   "priority": 162},
+    {"keyword": "DISNEY",           "category": "leisure_lifestyle", "match_type": "contains",   "priority": 163},
+    {"keyword": "NOW TV",           "category": "leisure_lifestyle", "match_type": "contains",   "priority": 164},
+    {"keyword": "AMAZON PRIME",     "category": "leisure_lifestyle", "match_type": "contains",   "priority": 165},
+    {"keyword": "PARAMOUNT",        "category": "leisure_lifestyle", "match_type": "contains",   "priority": 166},
+    {"keyword": "APPLE TV",         "category": "leisure_lifestyle", "match_type": "contains",   "priority": 167},
+    {"keyword": "ODEON",            "category": "leisure_lifestyle", "match_type": "contains",   "priority": 168},
+    {"keyword": "CINEWORLD",        "category": "leisure_lifestyle", "match_type": "contains",   "priority": 169},
+    {"keyword": "VUE CINEMA",       "category": "leisure_lifestyle", "match_type": "contains",   "priority": 170},
+    {"keyword": "TICKETMASTER",     "category": "leisure_lifestyle", "match_type": "contains",   "priority": 171},
+    {"keyword": "EVENTBRITE",       "category": "leisure_lifestyle", "match_type": "contains",   "priority": 172},
+    {"keyword": "AIRBNB",           "category": "leisure_lifestyle", "match_type": "contains",   "priority": 173},
+    {"keyword": "BOOKING.COM",      "category": "leisure_lifestyle", "match_type": "contains",   "priority": 174},
+    {"keyword": "PREMIER INN",      "category": "leisure_lifestyle", "match_type": "contains",   "priority": 175},
+    {"keyword": "TRAVELODGE",       "category": "leisure_lifestyle", "match_type": "contains",   "priority": 176},
+    {"keyword": "BET365",           "category": "leisure_lifestyle", "match_type": "contains",   "priority": 177},
+    {"keyword": "BETFAIR",          "category": "leisure_lifestyle", "match_type": "contains",   "priority": 178},
+    {"keyword": "PADDY POWER",      "category": "leisure_lifestyle", "match_type": "contains",   "priority": 179},
+    {"keyword": "WILLIAM HILL",     "category": "leisure_lifestyle", "match_type": "contains",   "priority": 180},
+    {"keyword": "LADBROKES",        "category": "leisure_lifestyle", "match_type": "contains",   "priority": 181},
+]
+
+# Default merchant rules — mapped against description_raw.
+# Merchant rules are checked BEFORE keyword rules in apply_rules so these
+# will fire for well-known merchants even when the description contains noise
+# (e.g. "TESCO STORES 1234" still matches the "TESCO" merchant rule).
+_DEFAULT_MERCHANT_RULES: list[dict] = [
+    # Telecoms & media (household_bills)
+    {"merchant_name": "VODAFONE",       "category": "household_bills",   "match_type": "contains", "priority": 10},
+    {"merchant_name": "O2",             "category": "household_bills",   "match_type": "contains", "priority": 11},
+    {"merchant_name": "EE LIMITED",     "category": "household_bills",   "match_type": "contains", "priority": 12},
+    {"merchant_name": "THREE MOBILE",   "category": "household_bills",   "match_type": "contains", "priority": 13},
+    {"merchant_name": "SKY DIGITAL",    "category": "household_bills",   "match_type": "contains", "priority": 14},
+    {"merchant_name": "VIRGIN MEDIA",   "category": "household_bills",   "match_type": "contains", "priority": 15},
+    {"merchant_name": "BT BROADBAND",   "category": "household_bills",   "match_type": "contains", "priority": 16},
+    # Utilities (household_bills)
+    {"merchant_name": "BRITISH GAS",    "category": "household_bills",   "match_type": "contains", "priority": 20},
+    {"merchant_name": "EDF ENERGY",     "category": "household_bills",   "match_type": "contains", "priority": 21},
+    {"merchant_name": "E.ON",           "category": "household_bills",   "match_type": "contains", "priority": 22},
+    {"merchant_name": "SCOTTISH POWER", "category": "household_bills",   "match_type": "contains", "priority": 23},
+    {"merchant_name": "NPOWER",         "category": "household_bills",   "match_type": "contains", "priority": 24},
+    {"merchant_name": "THAMES WATER",   "category": "household_bills",   "match_type": "contains", "priority": 25},
+    {"merchant_name": "ANGLIAN WATER",  "category": "household_bills",   "match_type": "contains", "priority": 26},
+    {"merchant_name": "SEVERN TRENT",   "category": "household_bills",   "match_type": "contains", "priority": 27},
+    {"merchant_name": "UNITED UTILITIES","category": "household_bills",  "match_type": "contains", "priority": 28},
+    {"merchant_name": "YORKSHIRE WATER","category": "household_bills",   "match_type": "contains", "priority": 29},
+    # Supermarkets (everyday_spending)
+    {"merchant_name": "TESCO",          "category": "everyday_spending", "match_type": "contains", "priority": 40},
+    {"merchant_name": "SAINSBURYS",     "category": "everyday_spending", "match_type": "contains", "priority": 41},
+    {"merchant_name": "ASDA",           "category": "everyday_spending", "match_type": "contains", "priority": 42},
+    {"merchant_name": "MORRISONS",      "category": "everyday_spending", "match_type": "contains", "priority": 43},
+    {"merchant_name": "WAITROSE",       "category": "everyday_spending", "match_type": "contains", "priority": 44},
+    {"merchant_name": "LIDL",           "category": "everyday_spending", "match_type": "contains", "priority": 45},
+    {"merchant_name": "ALDI",           "category": "everyday_spending", "match_type": "contains", "priority": 46},
+    {"merchant_name": "MARKS SPENCER",  "category": "everyday_spending", "match_type": "contains", "priority": 47},
+    {"merchant_name": "CO-OPERATIVE",   "category": "everyday_spending", "match_type": "contains", "priority": 48},
+    {"merchant_name": "ICELAND",        "category": "everyday_spending", "match_type": "contains", "priority": 49},
+    # Restaurants & coffee (everyday_spending)
+    {"merchant_name": "MCDONALDS",      "category": "everyday_spending", "match_type": "contains", "priority": 50},
+    {"merchant_name": "KFC",            "category": "everyday_spending", "match_type": "contains", "priority": 51},
+    {"merchant_name": "SUBWAY",         "category": "everyday_spending", "match_type": "contains", "priority": 52},
+    {"merchant_name": "GREGGS",         "category": "everyday_spending", "match_type": "contains", "priority": 53},
+    {"merchant_name": "STARBUCKS",      "category": "everyday_spending", "match_type": "contains", "priority": 54},
+    {"merchant_name": "COSTA COFFEE",   "category": "everyday_spending", "match_type": "contains", "priority": 55},
+    {"merchant_name": "PRET A MANGER",  "category": "everyday_spending", "match_type": "contains", "priority": 56},
+    {"merchant_name": "NANDOS",         "category": "everyday_spending", "match_type": "contains", "priority": 57},
+    {"merchant_name": "PIZZA EXPRESS",  "category": "everyday_spending", "match_type": "contains", "priority": 58},
+    {"merchant_name": "PIZZA HUT",      "category": "everyday_spending", "match_type": "contains", "priority": 59},
+    {"merchant_name": "WAGAMAMA",       "category": "everyday_spending", "match_type": "contains", "priority": 60},
+    # Food delivery (everyday_spending)
+    {"merchant_name": "DELIVEROO",      "category": "everyday_spending", "match_type": "contains", "priority": 61},
+    {"merchant_name": "JUST EAT",       "category": "everyday_spending", "match_type": "contains", "priority": 62},
+    {"merchant_name": "UBER EATS",      "category": "everyday_spending", "match_type": "contains", "priority": 63},
+    # Online retail (everyday_spending)
+    {"merchant_name": "AMAZON",         "category": "everyday_spending", "match_type": "contains", "priority": 65},
+    {"merchant_name": "EBAY",           "category": "everyday_spending", "match_type": "contains", "priority": 66},
+    {"merchant_name": "ARGOS",          "category": "everyday_spending", "match_type": "contains", "priority": 67},
+    {"merchant_name": "IKEA",           "category": "everyday_spending", "match_type": "contains", "priority": 68},
+    {"merchant_name": "PRIMARK",        "category": "everyday_spending", "match_type": "contains", "priority": 69},
+    {"merchant_name": "ASOS",           "category": "everyday_spending", "match_type": "contains", "priority": 70},
+    {"merchant_name": "JD SPORTS",      "category": "everyday_spending", "match_type": "contains", "priority": 71},
+    {"merchant_name": "SPORTS DIRECT",  "category": "everyday_spending", "match_type": "contains", "priority": 72},
+    # Transport
+    {"merchant_name": "TFL",            "category": "transport",         "match_type": "contains", "priority": 80},
+    {"merchant_name": "TRAINLINE",      "category": "transport",         "match_type": "contains", "priority": 81},
+    {"merchant_name": "RYANAIR",        "category": "transport",         "match_type": "contains", "priority": 82},
+    {"merchant_name": "EASYJET",        "category": "transport",         "match_type": "contains", "priority": 83},
+    {"merchant_name": "BRITISH AIRWAYS","category": "transport",         "match_type": "contains", "priority": 84},
+    {"merchant_name": "JET2",           "category": "transport",         "match_type": "contains", "priority": 85},
+    {"merchant_name": "UBER",           "category": "transport",         "match_type": "contains", "priority": 86},
+    # Health & personal
+    {"merchant_name": "BOOTS",          "category": "health_personal",   "match_type": "contains", "priority": 90},
+    {"merchant_name": "SUPERDRUG",      "category": "health_personal",   "match_type": "contains", "priority": 91},
+    {"merchant_name": "LLOYDS PHARMACY","category": "health_personal",   "match_type": "contains", "priority": 92},
+    {"merchant_name": "PUREGYM",        "category": "health_personal",   "match_type": "contains", "priority": 93},
+    {"merchant_name": "THE GYM GROUP",  "category": "health_personal",   "match_type": "contains", "priority": 94},
+    {"merchant_name": "NUFFIELD HEALTH","category": "health_personal",   "match_type": "contains", "priority": 95},
+    {"merchant_name": "DAVID LLOYD",    "category": "health_personal",   "match_type": "contains", "priority": 96},
+    {"merchant_name": "VIRGIN ACTIVE",  "category": "health_personal",   "match_type": "contains", "priority": 97},
+    {"merchant_name": "SPECSAVERS",     "category": "health_personal",   "match_type": "contains", "priority": 98},
+    # Leisure & lifestyle
+    {"merchant_name": "NETFLIX",        "category": "leisure_lifestyle", "match_type": "contains", "priority": 100},
+    {"merchant_name": "SPOTIFY",        "category": "leisure_lifestyle", "match_type": "contains", "priority": 101},
+    {"merchant_name": "DISNEY",         "category": "leisure_lifestyle", "match_type": "contains", "priority": 102},
+    {"merchant_name": "NOW TV",         "category": "leisure_lifestyle", "match_type": "contains", "priority": 103},
+    {"merchant_name": "AMAZON PRIME",   "category": "leisure_lifestyle", "match_type": "contains", "priority": 104},
+    {"merchant_name": "APPLE MUSIC",    "category": "leisure_lifestyle", "match_type": "contains", "priority": 105},
+    {"merchant_name": "APPLE TV",       "category": "leisure_lifestyle", "match_type": "contains", "priority": 106},
+    {"merchant_name": "PARAMOUNT",      "category": "leisure_lifestyle", "match_type": "contains", "priority": 107},
+    {"merchant_name": "ODEON",          "category": "leisure_lifestyle", "match_type": "contains", "priority": 108},
+    {"merchant_name": "CINEWORLD",      "category": "leisure_lifestyle", "match_type": "contains", "priority": 109},
+    {"merchant_name": "TICKETMASTER",   "category": "leisure_lifestyle", "match_type": "contains", "priority": 110},
+    {"merchant_name": "AIRBNB",         "category": "leisure_lifestyle", "match_type": "contains", "priority": 111},
+    {"merchant_name": "PREMIER INN",    "category": "leisure_lifestyle", "match_type": "contains", "priority": 112},
+    {"merchant_name": "TRAVELODGE",     "category": "leisure_lifestyle", "match_type": "contains", "priority": 113},
+    {"merchant_name": "BET365",         "category": "leisure_lifestyle", "match_type": "contains", "priority": 114},
+    {"merchant_name": "BETFAIR",        "category": "leisure_lifestyle", "match_type": "contains", "priority": 115},
+    {"merchant_name": "PADDY POWER",    "category": "leisure_lifestyle", "match_type": "contains", "priority": 116},
+    {"merchant_name": "WILLIAM HILL",   "category": "leisure_lifestyle", "match_type": "contains", "priority": 117},
+    {"merchant_name": "LADBROKES",      "category": "leisure_lifestyle", "match_type": "contains", "priority": 118},
+]
+
+# Default counterparty rules — matched against counterparty_name / counterparty.
+_DEFAULT_COUNTERPARTY_RULES: list[dict] = [
+    # Government & benefits
+    {"counterparty": "DWP",             "category": "income",            "match_type": "contains", "priority": 10},
+    {"counterparty": "HMRC",            "category": "income",            "match_type": "contains", "priority": 11},
+    {"counterparty": "UNIVERSAL CREDIT","category": "income",            "match_type": "contains", "priority": 12},
+    {"counterparty": "CHILD BENEFIT",   "category": "income",            "match_type": "contains", "priority": 13},
+    {"counterparty": "PENSION SERVICE", "category": "income",            "match_type": "contains", "priority": 14},
+    # Council (household_bills)
+    {"counterparty": "COUNCIL",         "category": "household_bills",   "match_type": "contains", "priority": 20},
+    # Utilities (household_bills)
+    {"counterparty": "BRITISH GAS",     "category": "household_bills",   "match_type": "contains", "priority": 25},
+    {"counterparty": "THAMES WATER",    "category": "household_bills",   "match_type": "contains", "priority": 26},
+    {"counterparty": "SCOTTISH POWER",  "category": "household_bills",   "match_type": "contains", "priority": 27},
+    # Telecoms (household_bills)
+    {"counterparty": "VODAFONE",        "category": "household_bills",   "match_type": "contains", "priority": 30},
+    {"counterparty": "VIRGIN MEDIA",    "category": "household_bills",   "match_type": "contains", "priority": 31},
+    {"counterparty": "SKY",             "category": "household_bills",   "match_type": "contains", "priority": 32},
+    # Financial
+    {"counterparty": "PAYPAL",          "category": "financial_banking", "match_type": "contains", "priority": 40},
+    {"counterparty": "WISE",            "category": "financial_banking", "match_type": "contains", "priority": 41},
+    {"counterparty": "REVOLUT",         "category": "financial_banking", "match_type": "contains", "priority": 42},
 ]
 
 
 def _seed_default_rules():
-    """Seed default UK bank keyword rules if the table is empty.
+    """Idempotently seed default UK bank categorisation rules.
 
-    Safe to call on every startup — it checks for existing rows first and
-    does nothing when rules have already been created (either by a previous
-    seed or by users via the API).
+    Unlike the previous approach (which only seeded when the table was
+    completely empty), this function uses stable deterministic rule IDs so
+    that:
+    - New deployments receive all default rules.
+    - Existing deployments receive any *new* default rules added in code
+      updates without overwriting rules created by users (whose IDs have
+      random suffixes like ``kr_abc12345``).
+    - Already-seeded default rules are skipped silently.
+    - Semantically identical rules created manually by users (same keyword +
+      category combination) are also skipped to avoid duplicates.
     """
     if SessionLocal is None:
         logger.warning("_seed_default_rules: SessionLocal is None — database not configured, skipping rule seeding")
         return
     db = SessionLocal()
     try:
-        if db.query(KeywordRule).first():
-            return  # Rules already exist — do not overwrite
+        added = 0
+
+        # ── Keyword rules ────────────────────────────────────────────────────
         for r in _DEFAULT_KEYWORD_RULES:
+            rule_id = _stable_rule_id("dkr", r["keyword"], r["category"])
+            if db.query(KeywordRule).filter(KeywordRule.rule_id == rule_id).first():
+                continue  # Already seeded
+            # Also skip if a semantically identical rule exists (different ID)
+            if db.query(KeywordRule).filter(
+                KeywordRule.keyword == r["keyword"],
+                KeywordRule.category == r["category"],
+            ).first():
+                continue
             db.add(KeywordRule(
-                rule_id=f"rule_{uuid4().hex[:8]}",
+                rule_id=rule_id,
                 keyword=r["keyword"],
                 category=r["category"],
-                match_type=r["match_type"],
+                match_type=r.get("match_type", "contains"),
                 case_sensitive=False,
                 priority=r["priority"],
                 enabled=True,
             ))
-        db.commit()
-        logger.info("Seeded %d default keyword categorisation rules", len(_DEFAULT_KEYWORD_RULES))
+            added += 1
+
+        # ── Merchant rules ───────────────────────────────────────────────────
+        for r in _DEFAULT_MERCHANT_RULES:
+            rule_id = _stable_rule_id("dmr", r["merchant_name"], r["category"])
+            if db.query(MerchantRule).filter(MerchantRule.rule_id == rule_id).first():
+                continue
+            if db.query(MerchantRule).filter(
+                MerchantRule.merchant_name == r["merchant_name"],
+                MerchantRule.category == r["category"],
+            ).first():
+                continue
+            db.add(MerchantRule(
+                rule_id=rule_id,
+                merchant_name=r["merchant_name"],
+                category=r["category"],
+                match_type=r.get("match_type", "contains"),
+                case_sensitive=False,
+                priority=r["priority"],
+                enabled=True,
+            ))
+            added += 1
+
+        # ── Counterparty rules ───────────────────────────────────────────────
+        for r in _DEFAULT_COUNTERPARTY_RULES:
+            rule_id = _stable_rule_id("dcr", r["counterparty"], r["category"])
+            if db.query(CounterpartyRule).filter(CounterpartyRule.rule_id == rule_id).first():
+                continue
+            if db.query(CounterpartyRule).filter(
+                CounterpartyRule.counterparty == r["counterparty"],
+                CounterpartyRule.category == r["category"],
+            ).first():
+                continue
+            db.add(CounterpartyRule(
+                rule_id=rule_id,
+                counterparty=r["counterparty"],
+                category=r["category"],
+                match_type=r.get("match_type", "contains"),
+                case_sensitive=False,
+                priority=r["priority"],
+                enabled=True,
+            ))
+            added += 1
+
+        if added:
+            db.commit()
+            logger.info("Seeded %d default categorisation rules", added)
+        else:
+            logger.debug("Default categorisation rules already up to date — nothing to seed")
     except Exception:
         db.rollback()
-        logger.exception("Failed to seed default keyword rules")
+        logger.exception("Failed to seed default categorisation rules")
     finally:
         db.close()
 
